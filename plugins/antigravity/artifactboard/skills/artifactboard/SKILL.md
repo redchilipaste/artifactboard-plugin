@@ -28,6 +28,12 @@ Every deck you generate or prepare for ArtifactBoard must satisfy all of the fol
   - **NEVER call `localStorage`, `sessionStorage`, or `document.cookie` unguarded.** Accessing `localStorage` or `sessionStorage` in an opaque origin throws `SecurityError` and will crash your slide script. Either avoid Web Storage completely or wrap any optional read/write in `try { ... } catch {}`.
   - Skip `document.startViewTransition()` when framed (`window.self !== window.top`) or when `prefers-reduced-motion: reduce` is set, preventing cross-origin OOPIF renderer crashes.
   - Do not make `fetch()`, `XMLHttpRequest`, or `WebSocket` calls (blocked by `connect-src 'none'`), and do not rely on `<base>` tags or `<form>` submissions.
+- **Hidden Deck Spec v2 metadata (`<head>`):**
+  - After implementing both the Presenter Mode bridge (`presenter-bridge-v1`) and hardware clicker key forwarding (`pointer-keys-v1`), declare them in `<head>`:
+    ```html
+    <meta name="artifactboard:deck-spec" content="2">
+    <meta name="artifactboard:features" content="presenter-bridge-v1,pointer-keys-v1">
+    ```
 
 ### Presenter Mode & Interactive Mirroring Bridge (`artifactboard-deck` v1)
 
@@ -70,7 +76,7 @@ window.addEventListener('message', (event) => {
 
 ## 2. Publishing & Board Management Workflow (MCP Tools)
 
-Always write the deck to a `.html` file on disk first, then use the 7 `artifactboard` MCP tools.
+Always write the deck to a `.html` file on disk first, then use the 8 `artifactboard` MCP tools.
 
 1. **Check authentication & quota:**
    - Call `artifactboard_status()`.
@@ -90,11 +96,15 @@ Always write the deck to a `.html` file on disk first, then use the 7 `artifactb
    - Default `visibility` is `"private"` unless the user asks for `"unlisted"` or `"public"`.
    - Returns `presentUrl`, `unlistedUrl`, and `boardUrl`.
 4. **List decks on the board:**
-   - Call `artifactboard_list_decks()` to inspect slugs, titles, visibility, sizes, and share URLs.
-5. **Update title, visibility, or unlisted link:**
+   - Call `artifactboard_list_decks()` to inspect slugs, titles, visibility, sizes, share URLs, and deck spec status (`up_to_date` vs `needs_backfill`, plus `outdatedCount`, `detectedFeatures`, and `missingFeatures`).
+5. **Download a deck straight to disk (zero LLM token copy):**
+   - Call `artifactboard_download_deck({ slug, output_path, overwrite?, expected_handle? })` to stream a published deck from your board directly to a local `.html` file without copying HTML through LLM tool arguments.
+6. **Update title, visibility, or unlisted link:**
    - Call `artifactboard_update_deck({ slug, title?, visibility?, rotate_unlisted_key? })`.
    - Ideal for switching a deck from `"private"` to `"public"` right before walking on stage, or rotating an `"unlisted"` key.
-6. **Delete a deck:**
+7. **Delete a deck:**
    - Call `artifactboard_delete_deck({ slug })` only when the user explicitly requests removal.
-7. **Sign out:**
+8. **Sign out:**
    - Call `artifactboard_logout({ revoke_remote? })` to revoke the saved CLI token on ArtifactBoard (default `revoke_remote: true`) and remove local credentials from `~/.config/artifactboard/credentials.json`.
+
+To audit and upgrade outdated or legacy decks to Deck Spec v2 without losing content or styling, use the companion `backfill-artifactboard` skill. To check for or pull the latest plugin update, use the companion `update-artifactboard` skill; if setup, sign-in, deck export, sandbox rendering, or Presentation Mode fails, use the companion `troubleshoot-artifactboard` skill to diagnose and resolve the issue.

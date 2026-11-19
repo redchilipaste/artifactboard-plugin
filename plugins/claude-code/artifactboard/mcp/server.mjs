@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import crypto from 'node:crypto';
 import { realpathSync } from 'node:fs';
-import { chmod, mkdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -15,9 +15,14 @@ const SUPPORTED_PROTOCOL_VERSIONS = new Set([
   '2025-06-18',
   '2025-11-25',
 ]);
-const SERVER_INFO = Object.freeze({ name: 'artifactboard', version: '1.0.0' });
+export const CURRENT_DECK_SPEC_VERSION = 2;
+export const CURRENT_REQUIRED_FEATURES = Object.freeze([
+  'presenter-bridge-v1',
+  'pointer-keys-v1',
+]);
+export const SERVER_INFO = Object.freeze({ name: 'artifactboard', version: '1.1.0' });
 const SERVER_INSTRUCTIONS =
-  'Author slide decks as a single self-contained .html file (<= 5 MB) with all CSS, JS, and SVG inlined and no external CDN scripts or stylesheets. Published decks render in an origin-isolated sandbox (sandbox="allow-scripts", connect-src \'none\'): guard any localStorage/sessionStorage access in try/catch, avoid fetch()/XHR/WebSocket calls, and skip document.startViewTransition() when framed (window.self !== window.top). Always write the .html deck to disk first, then call artifactboard_export_deck with file_path instead of passing HTML inline. To support synced two-tab Presentation Mode, populate data-title/data-notes on slides, pair CSS hover rules with :is(:hover, [data-ab-hover="true"]), and implement the artifactboard-deck / artifactboard-host postMessage bridge. When authenticating with artifactboard_login, always call it with no arguments first, show the returned userCode (and authorizeUrl fallback link) to the user in chat and let them know a browser confirmation popup is about to open, then call artifactboard_login({ resume_pending: true, open_browser: true }) to launch the browser popup and wait for approval.';
+  'Author slide decks as a single self-contained .html file (<= 5 MB) with all CSS, JS, and SVG inlined and no external CDN scripts or stylesheets. Published decks render in an origin-isolated sandbox (sandbox="allow-scripts", connect-src \'none\'): guard any localStorage/sessionStorage access in try/catch, avoid fetch()/XHR/WebSocket calls, and skip document.startViewTransition() when framed (window.self !== window.top). Always write the .html deck to disk first, then call artifactboard_export_deck with file_path instead of passing HTML inline. Include Deck Spec v2 hidden <meta> tags in <head> (<meta name="artifactboard:deck-spec" content="2"> and <meta name="artifactboard:features" content="presenter-bridge-v1,pointer-keys-v1">), populate data-title/data-notes on slides, pair CSS hover rules with :is(:hover, [data-ab-hover="true"]), implement the artifactboard-deck / artifactboard-host postMessage bridge, and support hardware presenter keys (., F5, Escape). To download an existing deck directly to disk without spending LLM tokens on raw HTML, call artifactboard_download_deck; to upgrade older decks to Deck Spec v2, consult the companion backfill-artifactboard skill. When authenticating with artifactboard_login, always call it with no arguments first, show the returned userCode (and authorizeUrl fallback link) to the user in chat and let them know a browser confirmation popup is about to open, then call artifactboard_login({ resume_pending: true, open_browser: true }) to launch the browser popup and wait for approval. To pull the latest plugin update, consult the companion update-artifactboard skill; when setup, sign-in, export, sandbox rendering, or Presentation Mode fails, consult the companion troubleshoot-artifactboard skill.';
 
 const MAX_DECK_BYTES = 5_242_880;
 const MAX_TITLE_LENGTH = 140;
@@ -32,7 +37,7 @@ const HANDLE_REGEX = /^[a-z0-9][a-z0-9-]{1,28}[a-z0-9]$/;
 const DECK_VISIBILITIES = new Set(['private', 'unlisted', 'public']);
 const ALLOWED_HTML_EXTENSIONS = new Set(['.html', '.htm']);
 
-const TOOLS = Object.freeze([
+export const TOOLS = Object.freeze([
   {
     name: 'artifactboard_status',
     description:
@@ -131,7 +136,8 @@ const TOOLS = Object.freeze([
   },
   {
     name: 'artifactboard_list_decks',
-    description: 'List all decks on your ArtifactBoard along with share URLs and quota summary.',
+    description:
+      'List all decks on your ArtifactBoard along with share URLs, Deck Spec status, and quota summary.',
     inputSchema: {
       type: 'object',
       properties: {},
@@ -198,6 +204,38 @@ const TOOLS = Object.freeze([
           default: true,
         },
       },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'artifactboard_download_deck',
+    description:
+      'Download a standalone .html/.htm deck from ArtifactBoard directly to a local file without returning raw HTML content in the response.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        slug: {
+          type: 'string',
+          description: 'Deck slug to download.',
+          pattern: '^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$',
+        },
+        output_path: {
+          type: 'string',
+          description: 'Local destination file path ending in .html or .htm.',
+          minLength: 1,
+        },
+        overwrite: {
+          type: 'boolean',
+          description: 'Whether to overwrite an existing regular file at output_path (default: false).',
+          default: false,
+        },
+        expected_handle: {
+          type: 'string',
+          description:
+            'Optional target ArtifactBoard handle (with or without leading @). Fails if the active token belongs to a different account.',
+        },
+      },
+      required: ['slug', 'output_path'],
       additionalProperties: false,
     },
   },
@@ -300,6 +338,258 @@ function extractHtmlTitle(htmlBuffer) {
     return '';
   }
   return decodeHtmlEntities(match[1]).replace(/\s+/g, ' ').trim();
+}
+
+const DECK_SPEC_VERSION_RE = /^[1-9]\d{0,3}$/;
+const FEATURE_TOKEN_RE = /^[a-z0-9][a-z0-9-]{0,47}$/;
+const MAX_DECK_FEATURES = 24;
+const PRESENTER_BRIDGE_MARKER_RE = /['"]artifactboard-deck['"]/;
+const POINTER_F5_KEY_RE = /['"][Ff]5['"]/;
+const POINTER_PERIOD_KEY_RE = /['"]\.['"]/;
+const POINTER_BLACKOUT_OR_B_RE = /blackout|['"][Bb]['"]/i;
+const HEAD_SCAN_LIMIT_BYTES = 65_536;
+const HEAD_CLOSE_TAG_RE = /<\/head(?:\s|>)/i;
+const META_TAG_RE = /<meta\b([^>]{1,1024})>/gi;
+const META_ATTR_RE =
+  /([A-Za-z_:][-A-Za-z0-9_:.]*)\s*(?:=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
+
+function sanitizeDeckSpecVersion(value) {
+  if (typeof value === 'number') {
+    return Number.isSafeInteger(value) && value >= 1 && value <= 9999 ? value : null;
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return DECK_SPEC_VERSION_RE.test(trimmed) ? Number(trimmed) : null;
+  }
+  return null;
+}
+
+function sanitizeDeckFeatures(value) {
+  let rawItems;
+  if (typeof value === 'string') {
+    rawItems = value.split(',');
+  } else if (Array.isArray(value)) {
+    rawItems = value;
+  } else {
+    return [];
+  }
+
+  const seen = new Set();
+  const features = [];
+  for (const item of rawItems) {
+    if (typeof item !== 'string') {
+      continue;
+    }
+    const token = item.trim().toLowerCase();
+    if (!FEATURE_TOKEN_RE.test(token) || seen.has(token)) {
+      continue;
+    }
+    seen.add(token);
+    features.push(token);
+    if (features.length >= MAX_DECK_FEATURES) {
+      break;
+    }
+  }
+  return features;
+}
+
+function detectLegacyDeckFeatures(htmlText) {
+  if (!htmlText) {
+    return [];
+  }
+  const features = [];
+  if (PRESENTER_BRIDGE_MARKER_RE.test(htmlText) && htmlText.includes('postMessage')) {
+    features.push('presenter-bridge-v1');
+  }
+  if (
+    POINTER_F5_KEY_RE.test(htmlText) &&
+    POINTER_PERIOD_KEY_RE.test(htmlText) &&
+    POINTER_BLACKOUT_OR_B_RE.test(htmlText)
+  ) {
+    features.push('pointer-keys-v1');
+  }
+  return features;
+}
+
+function isTagNameBoundary(char) {
+  return (
+    char === '>' ||
+    char === ' ' ||
+    char === '\t' ||
+    char === '\n' ||
+    char === '\r' ||
+    char === '/'
+  );
+}
+
+function findClosingTagEnd(lowerHtml, closePrefix, searchStart) {
+  let idx = searchStart;
+  while (idx < lowerHtml.length) {
+    const found = lowerHtml.indexOf(closePrefix, idx);
+    if (found === -1) {
+      return lowerHtml.length;
+    }
+    const nextChar = lowerHtml[found + closePrefix.length];
+    if (nextChar === undefined || isTagNameBoundary(nextChar)) {
+      const gt = lowerHtml.indexOf('>', found + closePrefix.length);
+      return gt === -1 ? lowerHtml.length : gt + 1;
+    }
+    idx = found + closePrefix.length;
+  }
+  return lowerHtml.length;
+}
+
+function toAsciiLower(text) {
+  return text.replace(/[A-Z]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) + 32));
+}
+
+function stripCommentsScriptsAndStyles(html) {
+  const lower = toAsciiLower(html);
+  const parts = [];
+  let pos = 0;
+
+  while (pos < html.length) {
+    const lt = html.indexOf('<', pos);
+    if (lt === -1) {
+      parts.push(html.slice(pos));
+      break;
+    }
+    if (lt > pos) {
+      parts.push(html.slice(pos, lt));
+    }
+
+    if (html.startsWith('<!--', lt)) {
+      const commentEnd = html.indexOf('-->', lt + 4);
+      parts.push(' ');
+      if (commentEnd === -1) {
+        pos = html.length;
+        break;
+      }
+      pos = commentEnd + 3;
+      continue;
+    }
+
+    if (lower.startsWith('<script', lt) && isTagNameBoundary(lower[lt + 7])) {
+      parts.push(' ');
+      pos = findClosingTagEnd(lower, '</script', lt + 7);
+      continue;
+    }
+
+    if (lower.startsWith('<style', lt) && isTagNameBoundary(lower[lt + 6])) {
+      parts.push(' ');
+      pos = findClosingTagEnd(lower, '</style', lt + 6);
+      continue;
+    }
+
+    parts.push('<');
+    pos = lt + 1;
+  }
+
+  return parts.join('');
+}
+
+function parseMetaAttributes(attrText) {
+  let name = null;
+  let content = null;
+  META_ATTR_RE.lastIndex = 0;
+  let match;
+  while ((match = META_ATTR_RE.exec(attrText)) !== null) {
+    const attrName = match[1].toLowerCase();
+    const attrValue = match[2] ?? match[3] ?? match[4] ?? '';
+    if (attrName === 'name') {
+      name = attrValue;
+    } else if (attrName === 'content') {
+      content = attrValue;
+    }
+  }
+  return { name, content };
+}
+
+/**
+ * Inspects standalone deck HTML for Deck Spec v2 <meta> tags and legacy feature hints.
+ * Mirrors extractDeckMetadata + evaluateDeckSpecStatus without external imports.
+ * @param {Buffer | string} htmlInput
+ */
+export function inspectDeckHtmlMetadata(htmlInput) {
+  const fullText = Buffer.isBuffer(htmlInput)
+    ? htmlInput.toString('utf8')
+    : typeof htmlInput === 'string'
+      ? htmlInput
+      : '';
+  const detectedFeatures = sanitizeDeckFeatures(detectLegacyDeckFeatures(fullText));
+
+  let boundedSlice = '';
+  if (Buffer.isBuffer(htmlInput)) {
+    boundedSlice = htmlInput.subarray(0, HEAD_SCAN_LIMIT_BYTES).toString('utf8');
+  } else if (typeof htmlInput === 'string') {
+    boundedSlice = htmlInput.slice(0, HEAD_SCAN_LIMIT_BYTES);
+  }
+
+  let version = null;
+  let features = [];
+
+  if (boundedSlice) {
+    const strippedSlice = stripCommentsScriptsAndStyles(boundedSlice);
+    const headCloseMatch = HEAD_CLOSE_TAG_RE.exec(strippedSlice);
+    const sanitizedHead = headCloseMatch
+      ? strippedSlice.slice(0, headCloseMatch.index)
+      : strippedSlice;
+
+    META_TAG_RE.lastIndex = 0;
+    let tagMatch;
+    while ((tagMatch = META_TAG_RE.exec(sanitizedHead)) !== null) {
+      const { name, content } = parseMetaAttributes(tagMatch[1]);
+      if (!name) {
+        continue;
+      }
+      const normalizedName = name.trim().toLowerCase();
+      if (normalizedName === 'artifactboard:deck-spec') {
+        if (version === null) {
+          version = sanitizeDeckSpecVersion(content);
+        }
+      } else if (normalizedName === 'artifactboard:features') {
+        const parsed = sanitizeDeckFeatures(content);
+        if (parsed.length > 0) {
+          features = sanitizeDeckFeatures([...features, ...parsed]);
+        }
+      }
+    }
+  }
+
+  const missingFromDeclared = CURRENT_REQUIRED_FEATURES.filter(
+    (feature) => !features.includes(feature),
+  );
+  const upToDate =
+    version !== null &&
+    version >= CURRENT_DECK_SPEC_VERSION &&
+    (features.length === 0 || missingFromDeclared.length === 0);
+  const missingFeatures = upToDate ? [] : missingFromDeclared;
+
+  return {
+    version,
+    label: version ? `v${version}` : 'Legacy',
+    currentVersion: CURRENT_DECK_SPEC_VERSION,
+    status: upToDate ? 'up_to_date' : 'needs_backfill',
+    upToDate,
+    features,
+    detectedFeatures,
+    missingFeatures,
+    exportedWithVersion: null,
+    exportedVia: null,
+  };
+}
+
+function buildDeckSpecWarning(deckSpec) {
+  const missingFeatures = Array.isArray(deckSpec?.missingFeatures) ? deckSpec.missingFeatures : [];
+  const missingSummary =
+    missingFeatures.length > 0 ? ` Missing features: ${missingFeatures.join(', ')}.` : '';
+  const versionSummary = deckSpec?.version
+    ? `Deck is on Deck Spec ${deckSpec.label} (current is v${CURRENT_DECK_SPEC_VERSION})`
+    : `Deck is missing Deck Spec v${CURRENT_DECK_SPEC_VERSION} <meta> tags`;
+  return (
+    `${versionSummary}.${missingSummary} ` +
+    'Use the companion backfill-artifactboard skill to upgrade this deck without losing content or styling.'
+  );
 }
 
 async function readJsonFileIfExists(filePath) {
@@ -418,7 +708,19 @@ function extractSavedCredentials(savedCreds) {
 }
 
 /**
- * Create an ArtifactBoard MCP server instance exposing the 7 deck/auth tools.
+ * Normalize an MCP clientInfo.name string into an allowlisted non-PII agent identifier.
+ * @param {unknown} name
+ * @returns {'antigravity' | 'claude-code' | 'mcp-other'}
+ */
+export function normalizeMcpClientAgent(name) {
+  if (typeof name !== 'string') return 'mcp-other';
+  if (/antigravity|gemini/i.test(name)) return 'antigravity';
+  if (/claude/i.test(name)) return 'claude-code';
+  return 'mcp-other';
+}
+
+/**
+ * Create an ArtifactBoard MCP server instance exposing the 8 deck/auth tools.
  * @param {object} [options]
  * @param {string} [options.origin]
  * @param {string} [options.credentialsPath]
@@ -430,6 +732,8 @@ export function createArtifactBoardMcpServer(options = {}) {
   if (typeof fetchImpl !== 'function') {
     throw new Error('Global fetch API (Node >= 22) is required.');
   }
+
+  let detectedClientAgent = 'mcp-other';
 
   const credentialsPath =
     options.credentialsPath ||
@@ -484,11 +788,58 @@ export function createArtifactBoardMcpServer(options = {}) {
     };
   }
 
+  function buildHttpError(response, rawText, secretsToRedact = []) {
+    let data = null;
+    if (typeof rawText === 'string' && rawText.trim().length > 0) {
+      try {
+        data = JSON.parse(rawText);
+      } catch {
+        data = null;
+      }
+    }
+
+    const serverCode =
+      (typeof data?.code === 'string' && data.code) ||
+      (typeof data?.error?.code === 'string' && data.error.code) ||
+      `HTTP_${response.status}`;
+    const serverMessage =
+      (typeof data?.error === 'string' && data.error) ||
+      (typeof data?.error?.message === 'string' && data.error.message) ||
+      (typeof data?.message === 'string' && data.message) ||
+      (typeof rawText === 'string' && rawText.trim().length > 0
+        ? rawText.trim().slice(0, 300)
+        : response.statusText);
+    const safeMessage = sanitizeSecrets(serverMessage, secretsToRedact);
+    return new ToolExecutionError(serverCode, safeMessage, response.status);
+  }
+
+  function buildRequestHeaders(initHeaders) {
+    const headers = {};
+    if (initHeaders instanceof Headers) {
+      for (const [key, value] of initHeaders.entries()) {
+        if (key.toLowerCase() !== 'x-ab-client') headers[key] = value;
+      }
+    } else if (Array.isArray(initHeaders)) {
+      for (const [key, value] of initHeaders) {
+        if (String(key).toLowerCase() !== 'x-ab-client') headers[key] = value;
+      }
+    } else if (initHeaders && typeof initHeaders === 'object') {
+      for (const [key, value] of Object.entries(initHeaders)) {
+        if (key.toLowerCase() !== 'x-ab-client') headers[key] = value;
+      }
+    }
+    headers['X-AB-Client'] = `${detectedClientAgent}/${SERVER_INFO.version}`;
+    return headers;
+  }
+
   async function requestJson(url, init = {}, secretsToRedact = []) {
+    const headers = buildRequestHeaders(init.headers);
+
     let response;
     try {
       response = await fetchImpl(url, {
         ...init,
+        headers,
         signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
       });
     } catch (err) {
@@ -500,30 +851,132 @@ export function createArtifactBoardMcpServer(options = {}) {
     }
 
     const rawText = await response.text();
-    let data = null;
-    if (rawText.trim().length > 0) {
-      try {
-        data = JSON.parse(rawText);
-      } catch {
-        data = null;
-      }
+    if (!response.ok) {
+      throw buildHttpError(response, rawText, secretsToRedact);
+    }
+
+    if (rawText.trim().length === 0) {
+      return {};
+    }
+    try {
+      return JSON.parse(rawText) ?? {};
+    } catch {
+      return {};
+    }
+  }
+
+  async function requestBuffer(url, init = {}, secretsToRedact = []) {
+    const headers = buildRequestHeaders(init.headers);
+    let response;
+    try {
+      response = await fetchImpl(url, {
+        ...init,
+        headers,
+        signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+      });
+    } catch (err) {
+      const msg = sanitizeSecrets(
+        err instanceof Error ? err.message : String(err),
+        secretsToRedact,
+      );
+      throw new ToolExecutionError('NETWORK_ERROR', `Request to ${url} failed: ${msg}`);
     }
 
     if (!response.ok) {
-      const serverCode =
-        (typeof data?.code === 'string' && data.code) ||
-        (typeof data?.error?.code === 'string' && data.error.code) ||
-        `HTTP_${response.status}`;
-      const serverMessage =
-        (typeof data?.error === 'string' && data.error) ||
-        (typeof data?.error?.message === 'string' && data.error.message) ||
-        (typeof data?.message === 'string' && data.message) ||
-        (rawText.trim().length > 0 ? rawText.trim().slice(0, 300) : response.statusText);
-      const safeMessage = sanitizeSecrets(serverMessage, secretsToRedact);
-      throw new ToolExecutionError(serverCode, safeMessage, response.status);
+      let rawText = '';
+      try {
+        rawText = await response.text();
+      } catch {
+        rawText = '';
+      }
+      throw buildHttpError(response, rawText, secretsToRedact);
     }
 
-    return data ?? {};
+    const rawContentLength = response.headers?.get?.('content-length');
+    if (rawContentLength !== null && rawContentLength !== undefined && rawContentLength !== '') {
+      const declaredBytes = Number(rawContentLength);
+      if (Number.isFinite(declaredBytes) && declaredBytes > MAX_DECK_BYTES) {
+        await response.body?.cancel?.().catch(() => {});
+        throw new ToolExecutionError(
+          'DECK_TOO_LARGE',
+          `Downloaded deck exceeds maximum allowed size of ${MAX_DECK_BYTES} bytes.`,
+        );
+      }
+    }
+
+    if (response.body && typeof response.body.getReader === 'function') {
+      const reader = response.body.getReader();
+      const chunks = [];
+      let totalBytes = 0;
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            break;
+          }
+          if (value && value.byteLength > 0) {
+            totalBytes += value.byteLength;
+            if (totalBytes > MAX_DECK_BYTES) {
+              await reader.cancel().catch(() => {});
+              throw new ToolExecutionError(
+                'DECK_TOO_LARGE',
+                `Downloaded deck exceeds maximum allowed size of ${MAX_DECK_BYTES} bytes.`,
+              );
+            }
+            chunks.push(Buffer.from(value));
+          }
+        }
+      } catch (err) {
+        if (err instanceof ToolExecutionError) {
+          throw err;
+        }
+        const msg = sanitizeSecrets(
+          err instanceof Error ? err.message : String(err),
+          secretsToRedact,
+        );
+        throw new ToolExecutionError('NETWORK_ERROR', `Request to ${url} failed: ${msg}`);
+      }
+      return Buffer.concat(chunks, totalBytes);
+    }
+
+    let arrayBuffer;
+    try {
+      arrayBuffer = await response.arrayBuffer();
+    } catch (err) {
+      const msg = sanitizeSecrets(
+        err instanceof Error ? err.message : String(err),
+        secretsToRedact,
+      );
+      throw new ToolExecutionError('NETWORK_ERROR', `Request to ${url} failed: ${msg}`);
+    }
+    const buffer = Buffer.from(arrayBuffer);
+    if (buffer.byteLength > MAX_DECK_BYTES) {
+      throw new ToolExecutionError(
+        'DECK_TOO_LARGE',
+        `Downloaded deck exceeds maximum allowed size of ${MAX_DECK_BYTES} bytes.`,
+      );
+    }
+    return buffer;
+  }
+
+  function normalizeExpectedHandle(rawExpectedHandle) {
+    if (rawExpectedHandle === undefined) {
+      return null;
+    }
+    if (typeof rawExpectedHandle !== 'string') {
+      throw new ToolExecutionError(
+        'INVALID_EXPECTED_HANDLE',
+        'expected_handle must be a string (3-30 lowercase alphanumeric characters or hyphens, with optional leading @).',
+      );
+    }
+    const normalized = rawExpectedHandle.trim().replace(/^@/, '').toLowerCase();
+    if (!HANDLE_REGEX.test(normalized)) {
+      throw new ToolExecutionError(
+        'INVALID_EXPECTED_HANDLE',
+        'expected_handle must be 3-30 lowercase alphanumeric characters or hyphens, starting and ending with alphanumeric.',
+      );
+    }
+    return normalized;
   }
 
   async function revokeTokenBestEffort(origin, token) {
@@ -1073,22 +1526,7 @@ export function createArtifactBoardMcpServer(options = {}) {
       throw new ToolExecutionError('INVALID_TITLE', 'title must be a string.');
     }
 
-    let normalizedExpectedHandle = null;
-    if (args.expected_handle !== undefined) {
-      if (typeof args.expected_handle !== 'string') {
-        throw new ToolExecutionError(
-          'INVALID_EXPECTED_HANDLE',
-          'expected_handle must be a string (3-30 lowercase alphanumeric characters or hyphens, with optional leading @).',
-        );
-      }
-      normalizedExpectedHandle = args.expected_handle.trim().replace(/^@/, '').toLowerCase();
-      if (!HANDLE_REGEX.test(normalizedExpectedHandle)) {
-        throw new ToolExecutionError(
-          'INVALID_EXPECTED_HANDLE',
-          'expected_handle must be 3-30 lowercase alphanumeric characters or hyphens, starting and ending with alphanumeric.',
-        );
-      }
-    }
+    const normalizedExpectedHandle = normalizeExpectedHandle(args.expected_handle);
 
     const { origin, token } = await requireAuth();
 
@@ -1113,6 +1551,8 @@ export function createArtifactBoardMcpServer(options = {}) {
       Authorization: `Bearer ${token}`,
       'Content-Type': 'text/html; charset=utf-8',
       'X-Deck-Title': encodeURIComponent(finalTitle),
+      'X-ArtifactBoard-Client': 'mcp',
+      'X-ArtifactBoard-Plugin-Version': SERVER_INFO.version,
     };
     if (args.visibility !== undefined) {
       headers['X-Deck-Visibility'] = args.visibility;
@@ -1131,6 +1571,12 @@ export function createArtifactBoardMcpServer(options = {}) {
       [token],
     );
 
+    const deckSpec = data.deckSpec || {
+      ...inspectDeckHtmlMetadata(htmlBuffer),
+      exportedWithVersion: SERVER_INFO.version,
+      exportedVia: 'mcp',
+    };
+
     return {
       handle: data.handle,
       slug: data.slug,
@@ -1140,6 +1586,8 @@ export function createArtifactBoardMcpServer(options = {}) {
       boardUrl: data.boardUrl,
       presentUrl: data.presentUrl,
       unlistedUrl: data.unlistedUrl,
+      deckSpec,
+      ...(!deckSpec.upToDate ? { warning: buildDeckSpecWarning(deckSpec) } : {}),
     };
   }
 
@@ -1155,9 +1603,169 @@ export function createArtifactBoardMcpServer(options = {}) {
       },
       [token],
     );
+    const decks = Array.isArray(data.decks) ? data.decks : [];
     return {
       user: data.user,
-      decks: data.decks ?? [],
+      currentDeckSpecVersion: data.currentDeckSpecVersion ?? CURRENT_DECK_SPEC_VERSION,
+      outdatedCount: Number.isInteger(data.outdatedCount)
+        ? data.outdatedCount
+        : decks.filter((d) => d?.deckSpec?.upToDate === false).length,
+      decks,
+    };
+  }
+
+  async function handleDownloadDeck(args) {
+    if (typeof args.slug !== 'string' || !SLUG_REGEX.test(args.slug)) {
+      throw new ToolExecutionError(
+        'INVALID_SLUG',
+        'slug must be 1-64 lowercase alphanumeric characters or hyphens, starting and ending with alphanumeric.',
+      );
+    }
+    if (typeof args.output_path !== 'string' || args.output_path.trim().length === 0) {
+      throw new ToolExecutionError('INVALID_ARGUMENTS', 'output_path must be a non-empty string.');
+    }
+    if (args.overwrite !== undefined && typeof args.overwrite !== 'boolean') {
+      throw new ToolExecutionError('INVALID_ARGUMENTS', 'overwrite must be a boolean.');
+    }
+    const overwrite = args.overwrite === true;
+    const normalizedExpectedHandle = normalizeExpectedHandle(args.expected_handle);
+
+    const resolvedPath = path.resolve(args.output_path);
+    const ext = path.extname(resolvedPath).toLowerCase();
+    if (!ALLOWED_HTML_EXTENSIONS.has(ext)) {
+      throw new ToolExecutionError(
+        'INVALID_OUTPUT_PATH',
+        'output_path must point to an .html or .htm file.',
+      );
+    }
+
+    let existingStats = null;
+    try {
+      existingStats = await lstat(resolvedPath);
+    } catch (err) {
+      if (!err || typeof err !== 'object' || err.code !== 'ENOENT') {
+        throw new ToolExecutionError(
+          'INVALID_OUTPUT_PATH',
+          `Unable to inspect output_path "${resolvedPath}": ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+
+    if (existingStats) {
+      if (existingStats.isSymbolicLink() || existingStats.isDirectory() || !existingStats.isFile()) {
+        throw new ToolExecutionError(
+          'INVALID_OUTPUT_PATH',
+          'output_path must not be a symbolic link, directory, or non-regular file.',
+        );
+      }
+      if (!overwrite) {
+        throw new ToolExecutionError(
+          'FILE_EXISTS',
+          'Output file already exists. Pass overwrite: true or choose a new output_path.',
+        );
+      }
+    }
+
+    const { origin, token } = await requireAuth();
+    const headers = {
+      Authorization: `Bearer ${token}`,
+    };
+    if (normalizedExpectedHandle !== null) {
+      headers['X-Expected-Handle'] = normalizedExpectedHandle;
+    }
+
+    const htmlBuffer = await requestBuffer(
+      `${origin}/api/v1/decks/${encodeURIComponent(args.slug)}/html`,
+      {
+        method: 'GET',
+        headers,
+      },
+      [token],
+    );
+
+    if (htmlBuffer.byteLength < 1) {
+      throw new ToolExecutionError(
+        'EMPTY_RESPONSE',
+        `Downloaded deck "${args.slug}" was empty; local file was not modified.`,
+      );
+    }
+
+    try {
+      await mkdir(path.dirname(resolvedPath), { recursive: true });
+    } catch (err) {
+      throw new ToolExecutionError(
+        'WRITE_FAILED',
+        `Unable to prepare output directory for "${resolvedPath}": ${sanitizeSecrets(
+          err instanceof Error ? err.message : String(err),
+          [token],
+        )}`,
+      );
+    }
+
+    if (!overwrite) {
+      try {
+        await writeFile(resolvedPath, htmlBuffer, { flag: 'wx' });
+      } catch (err) {
+        if (err && typeof err === 'object' && err.code === 'EEXIST') {
+          throw new ToolExecutionError(
+            'FILE_EXISTS',
+            'Output file already exists. Pass overwrite: true or choose a new output_path.',
+          );
+        }
+        throw new ToolExecutionError(
+          'WRITE_FAILED',
+          `Unable to write downloaded deck to "${resolvedPath}": ${sanitizeSecrets(
+            err instanceof Error ? err.message : String(err),
+            [token],
+          )}`,
+        );
+      }
+    } else {
+      const tempPath = `${resolvedPath}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+      try {
+        await writeFile(tempPath, htmlBuffer, { flag: 'wx' });
+        let currentStats = null;
+        try {
+          currentStats = await lstat(resolvedPath);
+        } catch (err) {
+          if (!err || typeof err !== 'object' || err.code !== 'ENOENT') {
+            throw err;
+          }
+        }
+        if (
+          currentStats &&
+          (currentStats.isSymbolicLink() || currentStats.isDirectory() || !currentStats.isFile())
+        ) {
+          throw new ToolExecutionError(
+            'INVALID_OUTPUT_PATH',
+            'output_path must not be a symbolic link, directory, or non-regular file.',
+          );
+        }
+        await rename(tempPath, resolvedPath);
+      } catch (err) {
+        await unlink(tempPath).catch(() => {});
+        if (err instanceof ToolExecutionError) {
+          throw err;
+        }
+        throw new ToolExecutionError(
+          'WRITE_FAILED',
+          `Unable to write downloaded deck to "${resolvedPath}": ${sanitizeSecrets(
+            err instanceof Error ? err.message : String(err),
+            [token],
+          )}`,
+        );
+      }
+    }
+
+    const sha256 = crypto.createHash('sha256').update(htmlBuffer).digest('hex');
+    const deckSpec = inspectDeckHtmlMetadata(htmlBuffer);
+
+    return {
+      slug: args.slug,
+      filePath: resolvedPath,
+      sizeBytes: htmlBuffer.byteLength,
+      sha256,
+      deckSpec,
     };
   }
 
@@ -1290,6 +1898,9 @@ export function createArtifactBoardMcpServer(options = {}) {
         case 'artifactboard_logout':
           payload = await handleLogout(args);
           break;
+        case 'artifactboard_download_deck':
+          payload = await handleDownloadDeck(args);
+          break;
         default:
           return formatToolResult(
             { error: 'UNKNOWN_TOOL', message: `Unknown tool: ${name}` },
@@ -1358,6 +1969,7 @@ export function createArtifactBoardMcpServer(options = {}) {
           error: { code: -32602, message: 'Invalid params: initialize params must be an object.' },
         };
       }
+      detectedClientAgent = normalizeMcpClientAgent(params?.clientInfo?.name);
       const requestedVersion = params?.protocolVersion;
       const protocolVersion = SUPPORTED_PROTOCOL_VERSIONS.has(requestedVersion)
         ? requestedVersion

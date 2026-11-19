@@ -11,7 +11,7 @@
       "name": "artifactboard",
       "description": "Author interactive, single-file HTML slide decks in Claude Code and publish them straight from disk to your personal ArtifactBoard.",
       "version": "1.0.0",
-      "source": "./plugins/artifactboard"
+      "source": "./plugins/claude-code/artifactboard"
     }
   ]
 }

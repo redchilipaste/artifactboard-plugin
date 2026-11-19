@@ -1,0 +1,27 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "artifactboard",
+  "displayName": "ArtifactBoard",
+  "version": "1.0.0",
+  "description": "Author interactive, single-file HTML slide decks in Antigravity and publish them straight from disk to your personal ArtifactBoard.",
+  "logo": "assets/logo.svg",
+  "author": {
+    "name": "redchilipaste",
+    "url": "https://github.com/redchilipaste"
+  },
+  "homepage": "https://artifactboard.com",
+  "repository": "https://github.com/redchilipaste/artifactboard-plugin",
+  "license": "MIT",
+  "keywords": [
+    "artifactboard",
+    "slides",
+    "presentations",
+    "html-deck",
+    "antigravity"
+  ],
+  "suggestedPrompts": [
+    "Create an interactive single-file HTML slide deck about our project and export it to ArtifactBoard",
+    "Check my ArtifactBoard login status and list my existing slide decks",
+    "Export my local slide deck HTML file to ArtifactBoard and set its visibility to public"
+  ]
+}

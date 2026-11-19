@@ -75,10 +75,12 @@ Always write the deck to a `.html` file on disk first, then use the 7 `artifactb
    - Call `artifactboard_status()`.
    - It checks `~/.config/artifactboard/credentials.json` and returns `{ handle, email, boardUrl, quota }` (or reports that login is needed).
    - Confirm the active `@handle` (and `email`) before publishing, especially if the user has multiple ArtifactBoard accounts.
-2. **Sign in or switch accounts:**
-   - If not authenticated, call `artifactboard_login()`.
-   - This starts device authorization (`/api/v1/cli/device/start`), opens the browser to `/cli/authorize?code=...` for one-click approval, and saves the `ab_live_...` token locally with `0600` permissions.
-   - To switch accounts, either call `artifactboard_logout()` followed by `artifactboard_login()`, or click **Switch account** on `/cli/authorize` in your browser during login approval.
+2. **Sign in or switch accounts (show confirmation code before browser popup):**
+   - If not authenticated, always use this two-step sequence so the user sees the matching confirmation code **before** the browser window opens:
+     1. Call `artifactboard_login()` with no arguments. It starts device authorization (`/api/v1/cli/device/start`) and returns `userCode` and `authorizeUrl` immediately without opening the browser or blocking.
+     2. In your visible chat message, show the exact confirmation code (`userCode`), include `authorizeUrl` as a fallback link, and tell the user a browser popup is coming up to verify the matching code and click **Approve CLI Access**.
+     3. Call `artifactboard_login({ resume_pending: true, open_browser: true })` to open `/cli/authorize?code=...` (after a brief beat so the chat message is visible first), wait for browser approval, and save the `ab_live_...` token locally with `0600` permissions.
+   - To switch accounts, either call `artifactboard_logout()` followed by the two-step `artifactboard_login()` flow, or click **Switch account** on `/cli/authorize` in your browser during login approval.
    - **Security rule:** Never inspect, log, or paste raw `ab_live_...` tokens into chat.
 3. **Export a deck directly from disk (zero LLM token copy):**
    - Call `artifactboard_export_deck({ file_path, title?, slug?, visibility?, expected_handle? })`.

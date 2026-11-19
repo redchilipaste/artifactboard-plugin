@@ -47,7 +47,7 @@ Both installers download the verified plugin archive into `~/.config/artifactboa
 ## Quick Start
 
 1. Ask Claude Code: *"Check my ArtifactBoard login status."*
-2. If you aren't signed in yet, Claude Code calls `artifactboard_login`, which opens `https://artifactboard.com/cli/authorize?code=...` in your browser for one-click approval.
+2. If you aren't signed in yet, Claude Code starts `artifactboard_login`, displays your device confirmation code in chat first, and then opens `https://artifactboard.com/cli/authorize?code=...` in your browser so you can match the code and approve access in one click.
 3. Ask Claude Code: *"Create an interactive HTML slide deck for this repo and export it to ArtifactBoard."*
 4. Claude Code writes the `.html` deck locally, streams it from disk via `artifactboard_export_deck`, and returns your personal board and share links.
 

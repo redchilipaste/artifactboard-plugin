@@ -85,7 +85,7 @@ Both direct installers unpack the verified plugin archive into `~/.config/artifa
 ## Quick Start
 
 1. Ask Antigravity or Claude Code: *"Check my ArtifactBoard login status."*
-2. If you aren't signed in yet, your agent calls `artifactboard_login`, which opens `https://artifactboard.com/cli/authorize?code=...` in your browser for one-click approval. Credentials are saved once at `~/.config/artifactboard/credentials.json` and shared across both agents.
+2. If you aren't signed in yet, your agent starts `artifactboard_login`, displays your device confirmation code in chat first, and then opens `https://artifactboard.com/cli/authorize?code=...` in your browser so you can match the code and approve access in one click. Credentials are saved once at `~/.config/artifactboard/credentials.json` and shared across both agents.
 3. Ask Antigravity or Claude Code: *"Create an interactive HTML slide deck for this repo and export it to ArtifactBoard."*
 4. Your agent writes the `.html` deck locally, streams it from disk via `artifactboard_export_deck`, and returns your personal board and share links.
 

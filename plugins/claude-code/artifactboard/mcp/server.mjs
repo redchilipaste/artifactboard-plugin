@@ -17,11 +17,13 @@ const SUPPORTED_PROTOCOL_VERSIONS = new Set([
 ]);
 const SERVER_INFO = Object.freeze({ name: 'artifactboard', version: '1.0.0' });
 const SERVER_INSTRUCTIONS =
-  'Author slide decks as a single self-contained .html file (<= 5 MB) with all CSS, JS, and SVG inlined and no external CDN scripts or stylesheets. Published decks render in an origin-isolated sandbox (sandbox="allow-scripts", connect-src \'none\'): guard any localStorage/sessionStorage access in try/catch, avoid fetch()/XHR/WebSocket calls, and skip document.startViewTransition() when framed (window.self !== window.top). Always write the .html deck to disk first, then call artifactboard_export_deck with file_path instead of passing HTML inline. To support synced two-tab Presentation Mode, populate data-title/data-notes on slides, pair CSS hover rules with :is(:hover, [data-ab-hover="true"]), and implement the artifactboard-deck / artifactboard-host postMessage bridge.';
+  'Author slide decks as a single self-contained .html file (<= 5 MB) with all CSS, JS, and SVG inlined and no external CDN scripts or stylesheets. Published decks render in an origin-isolated sandbox (sandbox="allow-scripts", connect-src \'none\'): guard any localStorage/sessionStorage access in try/catch, avoid fetch()/XHR/WebSocket calls, and skip document.startViewTransition() when framed (window.self !== window.top). Always write the .html deck to disk first, then call artifactboard_export_deck with file_path instead of passing HTML inline. To support synced two-tab Presentation Mode, populate data-title/data-notes on slides, pair CSS hover rules with :is(:hover, [data-ab-hover="true"]), and implement the artifactboard-deck / artifactboard-host postMessage bridge. When authenticating with artifactboard_login, always call it with no arguments first, show the returned userCode (and authorizeUrl fallback link) to the user in chat and let them know a browser confirmation popup is about to open, then call artifactboard_login({ resume_pending: true, open_browser: true }) to launch the browser popup and wait for approval.';
 
 const MAX_DECK_BYTES = 5_242_880;
 const MAX_TITLE_LENGTH = 140;
 const HTTP_TIMEOUT_MS = 30_000;
+const DEFAULT_RESUME_OPEN_DELAY_MS = 1500;
+const MAX_OPEN_DELAY_MS = 10_000;
 const MAX_FRAME_BYTES = 16 * 1024 * 1024;
 const MAX_HEADER_BYTES = 8192;
 
@@ -44,23 +46,33 @@ const TOOLS = Object.freeze([
   {
     name: 'artifactboard_login',
     description:
-      'Authenticate with ArtifactBoard via browser device flow and save credentials locally (0600 permissions).',
+      'Authenticate with ArtifactBoard via a two-step browser device flow and save credentials locally (0600 permissions). Step 1: call with no arguments to get userCode and authorizeUrl immediately without opening the browser. Step 2: show userCode in chat and tell the user a confirmation popup is about to open, then call with { resume_pending: true, open_browser: true } to launch the browser and wait for approval.',
     inputSchema: {
       type: 'object',
       properties: {
         wait_for_approval: {
           type: 'boolean',
-          description: 'Whether to poll until browser approval completes (default: true).',
-          default: true,
+          description:
+            'Whether to poll until browser approval completes (default: false when starting a new login so userCode returns immediately; true when resume_pending is true).',
+          default: false,
         },
         resume_pending: {
           type: 'boolean',
-          description: 'Resume polling a previously started pending login from disk.',
+          description:
+            'Resume a previously started pending login from disk, optionally opening the browser popup and polling for approval.',
           default: false,
         },
         open_browser: {
           type: 'boolean',
-          description: 'Open the authorization URL in the default browser.',
+          description:
+            'Open the authorization URL in the default browser (default: false on initial start; true on the first resume_pending call unless ARTIFACTBOARD_NO_BROWSER=1).',
+        },
+        open_delay_ms: {
+          type: 'number',
+          description:
+            'Optional delay in milliseconds before launching the browser popup so the confirmation code is visible in chat first (clamped to 0..10000; default: 1500 when launching the OS browser on resume_pending).',
+          minimum: 0,
+          maximum: 10000,
         },
         poll_timeout_ms: {
           type: 'number',
@@ -593,29 +605,191 @@ export function createArtifactBoardMcpServer(options = {}) {
     }
   }
 
+  function validateAuthorizeUrl(rawUrl, targetOrigin) {
+    if (typeof rawUrl !== 'string' || !rawUrl.trim()) {
+      throw new ToolExecutionError(
+        'INVALID_AUTHORIZE_URL',
+        'Authorization URL is missing or malformed.',
+      );
+    }
+    let parsedAuthUrl;
+    try {
+      parsedAuthUrl = new URL(rawUrl);
+    } catch {
+      throw new ToolExecutionError(
+        'INVALID_AUTHORIZE_URL',
+        'Authorization URL is malformed.',
+      );
+    }
+    if (parsedAuthUrl.username || parsedAuthUrl.password) {
+      throw new ToolExecutionError(
+        'INVALID_AUTHORIZE_URL',
+        'Refusing to use authorizeUrl because it contains embedded credentials.',
+      );
+    }
+    if (parsedAuthUrl.origin !== new URL(targetOrigin).origin) {
+      throw new ToolExecutionError(
+        'ORIGIN_MISMATCH',
+        'Refusing to open authorizeUrl because its origin does not match the ArtifactBoard origin.',
+      );
+    }
+    if (parsedAuthUrl.pathname !== '/cli/authorize') {
+      throw new ToolExecutionError(
+        'INVALID_AUTHORIZE_URL',
+        'Refusing to open authorizeUrl because its path is not /cli/authorize.',
+      );
+    }
+    return parsedAuthUrl.href;
+  }
+
+  async function openAuthorizeUrl(authorizeUrl) {
+    if (typeof options.openBrowser === 'function') {
+      await Promise.resolve()
+        .then(() => options.openBrowser(authorizeUrl))
+        .catch(() => {});
+    } else {
+      launchBrowserSafely(authorizeUrl);
+    }
+  }
+
+  async function completeApprovedLogin(pollData, targetOrigin) {
+    if (typeof pollData.rawToken !== 'string' || !pollData.rawToken) {
+      throw new ToolExecutionError(
+        'INVALID_SERVER_RESPONSE',
+        'Approved login response did not include an access token.',
+      );
+    }
+    const existingCreds = extractSavedCredentials(await readJsonFileIfExists(credentialsPath));
+    const handle = pollData.handle ?? null;
+    await writePrivateJsonFile(credentialsPath, {
+      origin: targetOrigin,
+      token: pollData.rawToken,
+      handle,
+      savedAt: new Date().toISOString(),
+    });
+    await unlink(pendingLoginPath).catch(() => {});
+
+    const loginResult = {
+      authenticated: true,
+      handle,
+      boardUrl: handle ? `${targetOrigin}/${encodeURIComponent(handle)}/boards` : null,
+      credentialsPath,
+    };
+    if (
+      existingCreds.token &&
+      existingCreds.origin &&
+      existingCreds.token !== pollData.rawToken
+    ) {
+      const revokeResult = await revokeTokenBestEffort(
+        existingCreds.origin,
+        existingCreds.token,
+      );
+      loginResult.previousTokenRevoked = revokeResult.revoked;
+    }
+    if (process.env.ARTIFACTBOARD_TOKEN) {
+      loginResult.warning =
+        'ARTIFACTBOARD_TOKEN is set in your environment and overrides the newly saved credentials file until unset.';
+    }
+    return loginResult;
+  }
+
+  async function pollDeviceOnce(targetOrigin, deviceCode) {
+    const pollData = await requestJson(
+      `${targetOrigin}/api/v1/cli/device/poll`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ deviceCode }),
+      },
+      [deviceCode],
+    );
+
+    if (pollData.status === 'approved') {
+      return { done: true, result: await completeApprovedLogin(pollData, targetOrigin) };
+    }
+
+    if (pollData.status === 'expired') {
+      await unlink(pendingLoginPath).catch(() => {});
+      throw new ToolExecutionError(
+        'LOGIN_EXPIRED',
+        'Device login session expired before approval. Call artifactboard_login() to start a new login.',
+      );
+    }
+
+    return { done: false };
+  }
+
   async function handleLogin(args) {
-    const waitForApproval = args.wait_for_approval !== undefined ? Boolean(args.wait_for_approval) : true;
-    const resumePending = args.resume_pending !== undefined ? Boolean(args.resume_pending) : false;
-    const pollTimeoutMs = clamp(Number(args.poll_timeout_ms ?? 60_000) || 60_000, 500, 300_000);
-    const pollIntervalMs = clamp(Number(args.poll_interval_ms ?? 1500) || 1500, 50, 30_000);
+    if (args.wait_for_approval !== undefined && typeof args.wait_for_approval !== 'boolean') {
+      throw new ToolExecutionError('INVALID_ARGUMENTS', 'wait_for_approval must be a boolean.');
+    }
+    if (args.resume_pending !== undefined && typeof args.resume_pending !== 'boolean') {
+      throw new ToolExecutionError('INVALID_ARGUMENTS', 'resume_pending must be a boolean.');
+    }
+    if (args.open_browser !== undefined && typeof args.open_browser !== 'boolean') {
+      throw new ToolExecutionError('INVALID_ARGUMENTS', 'open_browser must be a boolean.');
+    }
+    if (
+      args.open_delay_ms !== undefined &&
+      (typeof args.open_delay_ms !== 'number' || !Number.isFinite(args.open_delay_ms))
+    ) {
+      throw new ToolExecutionError('INVALID_ARGUMENTS', 'open_delay_ms must be a finite number.');
+    }
+    if (
+      args.poll_timeout_ms !== undefined &&
+      (typeof args.poll_timeout_ms !== 'number' || !Number.isFinite(args.poll_timeout_ms))
+    ) {
+      throw new ToolExecutionError('INVALID_ARGUMENTS', 'poll_timeout_ms must be a finite number.');
+    }
+    if (
+      args.poll_interval_ms !== undefined &&
+      (typeof args.poll_interval_ms !== 'number' || !Number.isFinite(args.poll_interval_ms))
+    ) {
+      throw new ToolExecutionError('INVALID_ARGUMENTS', 'poll_interval_ms must be a finite number.');
+    }
+
+    const resumePending = args.resume_pending ?? false;
+    const waitForApproval = args.wait_for_approval ?? resumePending;
+    const pollTimeoutMs = clamp(args.poll_timeout_ms ?? 60_000, 500, 300_000);
+    const pollIntervalMs = clamp(args.poll_interval_ms ?? 1500, 50, 30_000);
+    const hasCustomOpenBrowser = typeof options.openBrowser === 'function';
+    const openDelayMs =
+      args.open_delay_ms !== undefined
+        ? clamp(args.open_delay_ms, 0, MAX_OPEN_DELAY_MS)
+        : resumePending && !hasCustomOpenBrowser
+          ? DEFAULT_RESUME_OPEN_DELAY_MS
+          : 0;
+    const browserDisabledByEnv = process.env.ARTIFACTBOARD_NO_BROWSER === '1';
 
     const { origin: configuredOrigin } = await loadAuthContext();
     let targetOrigin = configuredOrigin;
     let deviceCode;
     let authorizeUrl;
     let userCode;
+    let expiresAt = null;
+    let browserOpened = false;
+    let alreadyPolledPending = false;
 
     if (resumePending) {
       const pending = await readJsonFileIfExists(pendingLoginPath);
       if (!pending || typeof pending.deviceCode !== 'string' || !pending.deviceCode) {
         throw new ToolExecutionError(
           'NO_PENDING_LOGIN',
-          'No pending device login found. Call artifactboard_login({ resume_pending: false }) to start a new login.',
+          'No pending device login found. Call artifactboard_login() to start a new login.',
         );
       }
-      targetOrigin = pending.origin
-        ? validateAndNormalizeOrigin(pending.origin)
-        : configuredOrigin;
+      if (pending.origin) {
+        try {
+          targetOrigin = validateAndNormalizeOrigin(pending.origin);
+        } catch (err) {
+          throw new ToolExecutionError(
+            'INVALID_PENDING_LOGIN',
+            err instanceof Error ? err.message : 'Pending login contains an invalid origin.',
+          );
+        }
+      } else {
+        targetOrigin = configuredOrigin;
+      }
       if (options.origin || process.env.ARTIFACTBOARD_ORIGIN) {
         if (targetOrigin !== configuredOrigin) {
           throw new ToolExecutionError(
@@ -624,9 +798,55 @@ export function createArtifactBoardMcpServer(options = {}) {
           );
         }
       }
+      if (typeof pending.expiresAt === 'string') {
+        const expiresAtMs = Date.parse(pending.expiresAt);
+        if (Number.isFinite(expiresAtMs)) {
+          if (Date.now() >= expiresAtMs) {
+            await unlink(pendingLoginPath).catch(() => {});
+            throw new ToolExecutionError(
+              'LOGIN_EXPIRED',
+              'Device login session expired before approval. Call artifactboard_login() to start a new login.',
+            );
+          }
+          expiresAt = pending.expiresAt;
+        }
+      }
+
       deviceCode = pending.deviceCode;
-      authorizeUrl = pending.authorizeUrl;
-      userCode = pending.userCode;
+      authorizeUrl = validateAuthorizeUrl(pending.authorizeUrl, targetOrigin);
+      userCode =
+        typeof pending.userCode === 'string' && pending.userCode.trim().length > 0
+          ? pending.userCode.trim()
+          : null;
+      const previouslyOpened = pending.browserOpened === true;
+      browserOpened = previouslyOpened;
+      const shouldOpenBrowser =
+        !browserDisabledByEnv &&
+        (args.open_browser !== undefined ? args.open_browser : !previouslyOpened);
+
+      if (shouldOpenBrowser || !waitForApproval) {
+        const initialPoll = await pollDeviceOnce(targetOrigin, deviceCode);
+        if (initialPoll.done) {
+          return initialPoll.result;
+        }
+        alreadyPolledPending = true;
+      }
+
+      if (shouldOpenBrowser) {
+        if (openDelayMs > 0) {
+          await delay(openDelayMs);
+        }
+        await writePrivateJsonFile(pendingLoginPath, {
+          deviceCode,
+          authorizeUrl,
+          userCode,
+          origin: targetOrigin,
+          expiresAt,
+          browserOpened: true,
+        });
+        await openAuthorizeUrl(authorizeUrl);
+        browserOpened = true;
+      }
     } else {
       const startData = await requestJson(`${targetOrigin}/api/v1/cli/device/start`, {
         method: 'POST',
@@ -638,134 +858,101 @@ export function createArtifactBoardMcpServer(options = {}) {
         typeof startData.deviceCode !== 'string' ||
         !startData.deviceCode ||
         typeof startData.authorizeUrl !== 'string' ||
-        !startData.authorizeUrl
+        !startData.authorizeUrl ||
+        typeof startData.userCode !== 'string' ||
+        !startData.userCode.trim()
       ) {
         throw new ToolExecutionError(
           'INVALID_SERVER_RESPONSE',
-          'Device start response did not include deviceCode and authorizeUrl.',
+          'Device start response did not include deviceCode, userCode, and authorizeUrl.',
         );
       }
 
-      let parsedAuthUrl;
-      try {
-        parsedAuthUrl = new URL(startData.authorizeUrl);
-      } catch {
-        throw new ToolExecutionError('INVALID_AUTHORIZE_URL', 'Server returned a malformed authorizeUrl.');
-      }
-      if (parsedAuthUrl.origin !== new URL(targetOrigin).origin) {
-        throw new ToolExecutionError(
-          'ORIGIN_MISMATCH',
-          'Refusing to open authorizeUrl because its origin does not match the ArtifactBoard origin.',
-        );
-      }
-
+      authorizeUrl = validateAuthorizeUrl(startData.authorizeUrl, targetOrigin);
       deviceCode = startData.deviceCode;
-      authorizeUrl = startData.authorizeUrl;
-      userCode = startData.userCode;
+      userCode = startData.userCode.trim();
       const expiresInSeconds = Number(startData.expiresIn) > 0 ? Number(startData.expiresIn) : 300;
-      const expiresAt = new Date(Date.now() + expiresInSeconds * 1000).toISOString();
+      expiresAt = new Date(Date.now() + expiresInSeconds * 1000).toISOString();
 
+      const shouldOpenBrowser = !browserDisabledByEnv && args.open_browser === true;
       await writePrivateJsonFile(pendingLoginPath, {
         deviceCode,
         authorizeUrl,
         userCode,
         origin: targetOrigin,
         expiresAt,
+        browserOpened: false,
       });
 
-      const shouldOpenBrowser =
-        args.open_browser !== undefined
-          ? Boolean(args.open_browser)
-          : process.env.ARTIFACTBOARD_NO_BROWSER !== '1';
       if (shouldOpenBrowser) {
-        if (typeof options.openBrowser === 'function') {
-          await Promise.resolve(options.openBrowser(authorizeUrl)).catch(() => {});
-        } else {
-          launchBrowserSafely(authorizeUrl);
+        if (openDelayMs > 0) {
+          await delay(openDelayMs);
         }
+        await writePrivateJsonFile(pendingLoginPath, {
+          deviceCode,
+          authorizeUrl,
+          userCode,
+          origin: targetOrigin,
+          expiresAt,
+          browserOpened: true,
+        });
+        await openAuthorizeUrl(authorizeUrl);
+        browserOpened = true;
       }
     }
 
-    if (!waitForApproval && !resumePending) {
-      return {
-        authenticated: false,
-        status: 'pending',
-        authorizeUrl,
-        userCode,
-        message: 'Approve in browser, then call artifactboard_login({ resume_pending: true })',
-      };
+    const codeLabel = userCode ? `confirmation code ${userCode}` : 'the device confirmation code';
+    const buildPendingResult = (message) => ({
+      authenticated: false,
+      status: 'pending',
+      authorizeUrl,
+      userCode,
+      expiresAt,
+      browserOpened,
+      message,
+    });
+
+    if (!waitForApproval) {
+      if (browserOpened) {
+        return buildPendingResult(
+          `Approve ${codeLabel} in your browser, then call artifactboard_login({ resume_pending: true, open_browser: false })`,
+        );
+      }
+      if (browserDisabledByEnv) {
+        return buildPendingResult(
+          `Browser auto-open is disabled (ARTIFACTBOARD_NO_BROWSER=1). Show ${codeLabel} and ${authorizeUrl} in chat so the user can approve in a browser, then call artifactboard_login({ resume_pending: true, open_browser: false })`,
+        );
+      }
+      return buildPendingResult(
+        `Show ${codeLabel} to the user in chat first and let them know a browser popup is coming up to confirm, then call artifactboard_login({ resume_pending: true, open_browser: true })`,
+      );
     }
 
-    const deadline = Date.now() + pollTimeoutMs;
-    while (true) {
-      const pollData = await requestJson(
-        `${targetOrigin}/api/v1/cli/device/poll`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ deviceCode }),
-        },
-        [deviceCode],
+    const buildTimeoutResult = () =>
+      buildPendingResult(
+        browserOpened
+          ? `Still waiting for browser approval of ${codeLabel}. Approve in browser, then call artifactboard_login({ resume_pending: true, open_browser: false })`
+          : `Still waiting for approval of ${codeLabel}. Have the user open ${authorizeUrl} to approve, then call artifactboard_login({ resume_pending: true, open_browser: false })`,
       );
 
-      if (pollData.status === 'approved') {
-        if (typeof pollData.rawToken !== 'string' || !pollData.rawToken) {
-          throw new ToolExecutionError(
-            'INVALID_SERVER_RESPONSE',
-            'Approved login response did not include an access token.',
-          );
-        }
-        const existingCreds = extractSavedCredentials(await readJsonFileIfExists(credentialsPath));
-        const handle = pollData.handle ?? null;
-        await writePrivateJsonFile(credentialsPath, {
-          origin: targetOrigin,
-          token: pollData.rawToken,
-          handle,
-          savedAt: new Date().toISOString(),
-        });
-        await unlink(pendingLoginPath).catch(() => {});
-
-        const loginResult = {
-          authenticated: true,
-          handle,
-          boardUrl: handle ? `${targetOrigin}/${encodeURIComponent(handle)}/boards` : null,
-          credentialsPath,
-        };
-        if (
-          existingCreds.token &&
-          existingCreds.origin &&
-          existingCreds.token !== pollData.rawToken
-        ) {
-          const revokeResult = await revokeTokenBestEffort(
-            existingCreds.origin,
-            existingCreds.token,
-          );
-          loginResult.previousTokenRevoked = revokeResult.revoked;
-        }
-        if (process.env.ARTIFACTBOARD_TOKEN) {
-          loginResult.warning =
-            'ARTIFACTBOARD_TOKEN is set in your environment and overrides the newly saved credentials file until unset.';
-        }
-        return loginResult;
+    const deadline = Date.now() + pollTimeoutMs;
+    if (alreadyPolledPending) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        return buildTimeoutResult();
       }
+      await delay(Math.min(pollIntervalMs, remaining));
+    }
 
-      if (pollData.status === 'expired') {
-        await unlink(pendingLoginPath).catch(() => {});
-        throw new ToolExecutionError(
-          'LOGIN_EXPIRED',
-          'Device login session expired before approval. Call artifactboard_login() to start a new login.',
-        );
+    while (true) {
+      const poll = await pollDeviceOnce(targetOrigin, deviceCode);
+      if (poll.done) {
+        return poll.result;
       }
 
       const remaining = deadline - Date.now();
       if (remaining <= 0) {
-        return {
-          authenticated: false,
-          status: 'pending',
-          authorizeUrl,
-          userCode,
-          message: 'Approve in browser, then call artifactboard_login({ resume_pending: true })',
-        };
+        return buildTimeoutResult();
       }
 
       await delay(Math.min(pollIntervalMs, remaining));

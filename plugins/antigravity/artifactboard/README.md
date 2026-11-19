@@ -54,7 +54,7 @@ agy plugin install .
 ## Quick Start
 
 1. Ask Antigravity: *"Check my ArtifactBoard login status."*
-2. If you aren't signed in yet, Antigravity calls `artifactboard_login`, which opens `https://artifactboard.com/cli/authorize?code=...` in your browser for one-click approval.
+2. If you aren't signed in yet, Antigravity starts `artifactboard_login`, displays your device confirmation code in chat first, and then opens `https://artifactboard.com/cli/authorize?code=...` in your browser so you can match the code and approve access in one click.
 3. Ask Antigravity: *"Create an interactive HTML slide deck for this repo and export it to ArtifactBoard."*
 4. Antigravity writes the `.html` deck locally, streams it from disk via `artifactboard_export_deck`, and returns your personal board and share links.
 

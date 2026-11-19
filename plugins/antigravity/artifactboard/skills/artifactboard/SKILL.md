@@ -22,6 +22,7 @@ Every deck you generate or prepare for ArtifactBoard must satisfy all of the fol
   - Bind `ArrowRight` / `PageDown` / `Space` (when focus is not on an interactive `BUTTON`, `INPUT`, `TEXTAREA`, or `SELECT`) to advance slides.
   - Bind `ArrowLeft` / `PageUp` to go back, `Home` for the first slide, and `End` for the last slide.
   - Optionally support `F` (fullscreen), `G` (slide overview dialog), and `N` or `?` (speaker notes), ignoring keystrokes inside form fields.
+  - When framed, forward hardware clicker shortcuts (`B` / `.` as `'b'` for blackout, plain `F5` with `preventDefault()` as `'f5'` so clickers never reload the tab, and `Escape` as `'escape'` when no deck modal is open).
 - **Sandbox & CSP safety (`sandbox="allow-scripts"`, `connect-src 'none'`):**
   - Published decks render inside an opaque-origin `sandbox="allow-scripts"` iframe with `connect-src 'none'`, `base-uri 'none'`, and `form-action 'none'`.
   - **NEVER call `localStorage`, `sessionStorage`, or `document.cookie` unguarded.** Accessing `localStorage` or `sessionStorage` in an opaque origin throws `SecurityError` and will crash your slide script. Either avoid Web Storage completely or wrap any optional read/write in `try { ... } catch {}`.
@@ -38,7 +39,7 @@ To support synced two-tab Presentation Mode (Fullscreen Stage + Speaker Console 
 - **`postMessage` contract (only when framed, validating `event.source === window.parent && event.data?.source === 'artifactboard-host'`):**
   - **Deck → Host (`source: 'artifactboard-deck', version: 1`):**
     - `state`: `{ type: 'state', origin, index, total, title, notes, nextTitle, nextNotes, slides: [{ index, title }] }`
-    - `shortcut`: `{ type: 'shortcut', key }` (`'f'`, `'p'`, `'b'`, `'l'`)
+    - `shortcut`: `{ type: 'shortcut', key }` (`'f'`, `'f5'`, `'p'`, `'b'` including `.`, `'l'`, `'escape'`)
     - `interact`: `{ type: 'interact', kind: 'hover' | 'leave' | 'click' | 'input' | 'pointer', target, x?, y?, value?, checked? }`
   - **Host → Deck (`source: 'artifactboard-host', version: 1`):**
     - `cmd`: `{ type: 'cmd', action: 'next' | 'prev' | 'first' | 'last' | 'goto' | 'requestState', index? }`

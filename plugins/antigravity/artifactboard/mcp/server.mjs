@@ -17,7 +17,7 @@ const SUPPORTED_PROTOCOL_VERSIONS = new Set([
 ]);
 const SERVER_INFO = Object.freeze({ name: 'artifactboard', version: '1.0.0' });
 const SERVER_INSTRUCTIONS =
-  'Author slide decks as a single self-contained .html file (<= 5 MB) with all CSS, JS, and SVG inlined and no external CDN scripts or stylesheets. Published decks render in an origin-isolated sandbox (sandbox="allow-scripts", connect-src \'none\'): guard any localStorage/sessionStorage access in try/catch, avoid fetch()/XHR/WebSocket calls, and skip document.startViewTransition() when framed (window.self !== window.top). Always write the .html deck to disk first, then call artifactboard_export_deck with file_path instead of passing HTML inline.';
+  'Author slide decks as a single self-contained .html file (<= 5 MB) with all CSS, JS, and SVG inlined and no external CDN scripts or stylesheets. Published decks render in an origin-isolated sandbox (sandbox="allow-scripts", connect-src \'none\'): guard any localStorage/sessionStorage access in try/catch, avoid fetch()/XHR/WebSocket calls, and skip document.startViewTransition() when framed (window.self !== window.top). Always write the .html deck to disk first, then call artifactboard_export_deck with file_path instead of passing HTML inline. To support synced two-tab Presentation Mode, populate data-title/data-notes on slides, pair CSS hover rules with :is(:hover, [data-ab-hover="true"]), and implement the artifactboard-deck / artifactboard-host postMessage bridge.';
 
 const MAX_DECK_BYTES = 5_242_880;
 const MAX_TITLE_LENGTH = 140;

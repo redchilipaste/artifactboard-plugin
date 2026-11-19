@@ -10,6 +10,7 @@ Both plugins share the exact same zero-dependency Node.js `>= 22` stdio MCP serv
 - **Claude Code Plugin (`plugins/claude-code/artifactboard/` & `.claude-plugin/marketplace.json`):** Native Claude Code marketplace manifest, `.claude-plugin/plugin.json`, `.mcp.json`, shared `SKILL.md`, shared `mcp/server.mjs`, and `assets/logo.svg`.
 - **Skill (`skills/artifactboard/SKILL.md`):** Guides Antigravity and Claude Code to generate responsive, self-contained 16:9 HTML slide decks (`<= 5 MB`) compatible with ArtifactBoard's origin-isolated presentation sandbox (`sandbox="allow-scripts"`, `connect-src 'none'`).
 - **Local MCP Server (`mcp/server.mjs`):** Zero-dependency Node.js stdio Model Context Protocol server that handles browser-approved device login and streams `.html` decks directly from disk.
+- **Synced Presentation Mode:** Press `F` to present fullscreen or `P` to open the two-tab Speaker Console with live interactive hover/click mirroring, speaker notes, timer, virtual laser (`L`), and blackout (`B`).
 
 ## Requirements
 

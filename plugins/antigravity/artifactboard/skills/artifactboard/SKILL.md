@@ -28,6 +28,45 @@ Every deck you generate or prepare for ArtifactBoard must satisfy all of the fol
   - Skip `document.startViewTransition()` when framed (`window.self !== window.top`) or when `prefers-reduced-motion: reduce` is set, preventing cross-origin OOPIF renderer crashes.
   - Do not make `fetch()`, `XMLHttpRequest`, or `WebSocket` calls (blocked by `connect-src 'none'`), and do not rely on `<base>` tags or `<form>` submissions.
 
+### Presenter Mode & Interactive Mirroring Bridge (`artifactboard-deck` v1)
+
+To support synced two-tab Presentation Mode (Fullscreen Stage + Speaker Console with live hover/click mirroring):
+
+- **Slide metadata & privacy:** Put `data-title="..."` and `data-notes="..."` on each `.slide` element. **Privacy reminder:** speaker notes in `public` decks live directly in the HTML source—never put secrets, tokens, or passwords in public speaker notes.
+- **CSS hover mirroring:** Pair interactive `:hover` rules (`.card`, `.flow-node`, `.choice-btn`, `.tab-btn`) with `:is(:hover, [data-ab-hover="true"])` so mirrored Speaker Console hovers animate on the fullscreen stage.
+- **Safe targets & loop guard:** Only target elements inside `.slide.is-active` (ignore outer toolbar buttons). Serialize targets as `{ id?, slideIndex, path }` (safe `id` + child-index `path`), resolve with `document.getElementById` + `activeSlide.children` (never `querySelector` with untrusted strings), and guard replayed DOM actions with `isReplaying = true` inside `try/finally`.
+- **`postMessage` contract (only when framed, validating `event.source === window.parent && event.data?.source === 'artifactboard-host'`):**
+  - **Deck → Host (`source: 'artifactboard-deck', version: 1`):**
+    - `state`: `{ type: 'state', origin, index, total, title, notes, nextTitle, nextNotes, slides: [{ index, title }] }`
+    - `shortcut`: `{ type: 'shortcut', key }` (`'f'`, `'p'`, `'b'`, `'l'`)
+    - `interact`: `{ type: 'interact', kind: 'hover' | 'leave' | 'click' | 'input' | 'pointer', target, x?, y?, value?, checked? }`
+  - **Host → Deck (`source: 'artifactboard-host', version: 1`):**
+    - `cmd`: `{ type: 'cmd', action: 'next' | 'prev' | 'first' | 'last' | 'goto' | 'requestState', index? }`
+    - `interact`: `{ type: 'interact', kind: 'hover' | 'leave' | 'click' | 'input', target, value?, checked? }`
+
+```js
+let isReplaying = false;
+const postToHost = (payload) => { try { if (window.parent && window.parent !== window) window.parent.postMessage({ source: 'artifactboard-deck', version: 1, ...payload }, '*'); } catch {} };
+const emitState = (origin = 'user') => postToHost({ type: 'state', origin, index: currentIndex, total, title: activeSlide.dataset.title || '', notes: activeSlide.dataset.notes || '', nextTitle: nextSlide?.dataset.title || '', nextNotes: nextSlide?.dataset.notes || '', slides: slides.map((s, i) => ({ index: i, title: s.dataset.title || '' })) });
+window.addEventListener('message', (event) => {
+  if (event.source !== window.parent || event.data?.source !== 'artifactboard-host') return;
+  const msg = event.data;
+  if (msg.type === 'cmd') {
+    if (msg.action === 'requestState') return emitState('host');
+    if (msg.action === 'goto' && Number.isInteger(msg.index)) return goToSlide(msg.index, { fromHost: true });
+    if (msg.action === 'next' || msg.action === 'prev') return goToSlide(currentIndex + (msg.action === 'next' ? 1 : -1), { fromHost: true });
+  } else if (msg.type === 'interact') {
+    isReplaying = true;
+    try {
+      document.querySelectorAll('[data-ab-hover]').forEach((el) => el.removeAttribute('data-ab-hover'));
+      const targetEl = resolveTarget(msg.target); // walks activeSlide.children along target.path
+      if (msg.kind === 'hover' && targetEl) for (let cur = targetEl; cur && cur !== activeSlide; cur = cur.parentElement) cur.setAttribute('data-ab-hover', 'true');
+      if (msg.kind === 'click' && targetEl) targetEl.click();
+    } finally { isReplaying = false; }
+  }
+});
+```
+
 ## 2. Publishing & Board Management Workflow (MCP Tools)
 
 Always write the deck to a `.html` file on disk first, then use the 7 `artifactboard` MCP tools.

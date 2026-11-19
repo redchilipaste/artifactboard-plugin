@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "artifactboard",
+  "description": "Official ArtifactBoard plugin marketplace for Claude Code — author single-file HTML slide decks and publish them from disk.",
+  "owner": {
+    "name": "redchilipaste",
+    "url": "https://github.com/redchilipaste"
+  },
+  "plugins": [
+    {
+      "name": "artifactboard",
+      "description": "Author interactive, single-file HTML slide decks in Claude Code and publish them straight from disk to your personal ArtifactBoard.",
+      "version": "1.0.0",
+      "source": "./plugins/artifactboard"
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "name": "artifactboard",
+  "displayName": "ArtifactBoard",
+  "version": "1.0.0",
+  "description": "Author interactive, single-file HTML slide decks in Claude Code and publish them straight from disk to your personal ArtifactBoard.",
+  "author": {
+    "name": "redchilipaste",
+    "url": "https://github.com/redchilipaste"
+  },
+  "homepage": "https://artifactboard.com",
+  "repository": "https://github.com/redchilipaste/artifactboard-plugin",
+  "license": "MIT",
+  "keywords": [
+    "artifactboard",
+    "slides",
+    "presentations",
+    "html-deck",
+    "claude-code"
+  ]
+}

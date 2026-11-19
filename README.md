@@ -92,12 +92,13 @@ Both direct installers unpack the verified plugin archive into `~/.config/artifa
 
 | Tool | Purpose |
 | :--- | :--- |
-| `artifactboard_status` | Check local sign-in status, `@handle`, board URL, and storage quota |
+| `artifactboard_status` | Check local sign-in status, `@handle`, email, board URL, and storage quota |
 | `artifactboard_login` | Run browser-approved device-code sign-in and save credentials locally (`0600`) |
-| `artifactboard_export_deck` | Stream a local `.html` file (`<= 5 MB`) straight from disk to your board |
+| `artifactboard_export_deck` | Stream a local `.html` file (`<= 5 MB`) straight from disk to your board (with optional `expected_handle` guard) |
 | `artifactboard_list_decks` | List decks on your board with visibility, sizes, and share URLs |
 | `artifactboard_update_deck` | Update title, change visibility (`private`/`unlisted`/`public`), or rotate an unlisted key |
 | `artifactboard_delete_deck` | Permanently delete a deck from your board |
+| `artifactboard_logout` | Sign out on this machine, revoking the saved CLI token and removing local credentials |
 
 ## Configuration (Optional Environment Variables)
 

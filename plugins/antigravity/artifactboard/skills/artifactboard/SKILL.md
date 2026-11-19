@@ -30,18 +30,21 @@ Every deck you generate or prepare for ArtifactBoard must satisfy all of the fol
 
 ## 2. Publishing & Board Management Workflow (MCP Tools)
 
-Always write the deck to a `.html` file on disk first, then use the 6 `artifactboard` MCP tools.
+Always write the deck to a `.html` file on disk first, then use the 7 `artifactboard` MCP tools.
 
 1. **Check authentication & quota:**
    - Call `artifactboard_status()`.
-   - It checks `~/.config/artifactboard/credentials.json` and returns `{ handle, boardUrl, quota }` (or reports that login is needed).
-2. **Sign in (if not authenticated):**
-   - Call `artifactboard_login()`.
+   - It checks `~/.config/artifactboard/credentials.json` and returns `{ handle, email, boardUrl, quota }` (or reports that login is needed).
+   - Confirm the active `@handle` (and `email`) before publishing, especially if the user has multiple ArtifactBoard accounts.
+2. **Sign in or switch accounts:**
+   - If not authenticated, call `artifactboard_login()`.
    - This starts device authorization (`/api/v1/cli/device/start`), opens the browser to `/cli/authorize?code=...` for one-click approval, and saves the `ab_live_...` token locally with `0600` permissions.
+   - To switch accounts, either call `artifactboard_logout()` followed by `artifactboard_login()`, or click **Switch account** on `/cli/authorize` in your browser during login approval.
    - **Security rule:** Never inspect, log, or paste raw `ab_live_...` tokens into chat.
 3. **Export a deck directly from disk (zero LLM token copy):**
-   - Call `artifactboard_export_deck({ file_path, title?, slug?, visibility? })`.
+   - Call `artifactboard_export_deck({ file_path, title?, slug?, visibility?, expected_handle? })`.
    - **Always pass `file_path` pointing to the `.html` file on disk.** The MCP server streams bytes straight from disk so zero HTML tokens are copied through LLM tool arguments.
+   - When the user specifies a target account (e.g., `@handle`), pass `expected_handle` so the upload is rejected if a different account is currently signed in.
    - Default `visibility` is `"private"` unless the user asks for `"unlisted"` or `"public"`.
    - Returns `presentUrl`, `unlistedUrl`, and `boardUrl`.
 4. **List decks on the board:**
@@ -51,3 +54,5 @@ Always write the deck to a `.html` file on disk first, then use the 6 `artifactb
    - Ideal for switching a deck from `"private"` to `"public"` right before walking on stage, or rotating an `"unlisted"` key.
 6. **Delete a deck:**
    - Call `artifactboard_delete_deck({ slug })` only when the user explicitly requests removal.
+7. **Sign out:**
+   - Call `artifactboard_logout({ revoke_remote? })` to revoke the saved CLI token on ArtifactBoard (default `revoke_remote: true`) and remove local credentials from `~/.config/artifactboard/credentials.json`.

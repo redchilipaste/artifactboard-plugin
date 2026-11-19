@@ -26,6 +26,7 @@ const MAX_FRAME_BYTES = 16 * 1024 * 1024;
 const MAX_HEADER_BYTES = 8192;
 
 const SLUG_REGEX = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
+const HANDLE_REGEX = /^[a-z0-9][a-z0-9-]{1,28}[a-z0-9]$/;
 const DECK_VISIBILITIES = new Set(['private', 'unlisted', 'public']);
 const ALLOWED_HTML_EXTENSIONS = new Set(['.html', '.htm']);
 
@@ -33,7 +34,7 @@ const TOOLS = Object.freeze([
   {
     name: 'artifactboard_status',
     description:
-      'Check ArtifactBoard authentication status, handle, board URL, tier, and deck storage quota.',
+      'Check ArtifactBoard authentication status, handle, email, board URL, tier, and deck storage quota.',
     inputSchema: {
       type: 'object',
       properties: {},
@@ -106,6 +107,11 @@ const TOOLS = Object.freeze([
           description: 'Deck visibility setting.',
           enum: ['private', 'unlisted', 'public'],
         },
+        expected_handle: {
+          type: 'string',
+          description:
+            'Optional target ArtifactBoard handle (with or without leading @). Fails if the active token belongs to a different account.',
+        },
       },
       required: ['file_path'],
       additionalProperties: false,
@@ -163,6 +169,23 @@ const TOOLS = Object.freeze([
         },
       },
       required: ['slug'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'artifactboard_logout',
+    description:
+      'Sign out of ArtifactBoard on this machine, revoking the saved CLI token on the server and removing local credentials.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        revoke_remote: {
+          type: 'boolean',
+          description:
+            'Revoke the saved token on ArtifactBoard before clearing local credentials (default: true).',
+          default: true,
+        },
+      },
       additionalProperties: false,
     },
   },
@@ -365,8 +388,25 @@ class ToolExecutionError extends Error {
   }
 }
 
+function extractSavedCredentials(savedCreds) {
+  const token =
+    typeof savedCreds?.token === 'string' && savedCreds.token.length > 0
+      ? savedCreds.token
+      : null;
+  const handle = savedCreds?.handle ?? null;
+  let origin = null;
+  if (typeof savedCreds?.origin === 'string' && savedCreds.origin.trim().length > 0) {
+    try {
+      origin = validateAndNormalizeOrigin(savedCreds.origin);
+    } catch {
+      origin = null;
+    }
+  }
+  return { token, origin, handle };
+}
+
 /**
- * Create an ArtifactBoard MCP server instance exposing the 6 deck/auth tools.
+ * Create an ArtifactBoard MCP server instance exposing the 7 deck/auth tools.
  * @param {object} [options]
  * @param {string} [options.origin]
  * @param {string} [options.credentialsPath]
@@ -474,6 +514,28 @@ export function createArtifactBoardMcpServer(options = {}) {
     return data ?? {};
   }
 
+  async function revokeTokenBestEffort(origin, token) {
+    try {
+      await requestJson(
+        `${origin}/api/v1/cli/tokens/current`,
+        {
+          method: 'DELETE',
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        },
+        [token],
+      );
+      return { revoked: true };
+    } catch (err) {
+      const reason = sanitizeSecrets(
+        err instanceof Error ? err.message : String(err),
+        [token],
+      );
+      return { revoked: false, reason };
+    }
+  }
+
   async function requireAuth() {
     const { origin, token } = await loadAuthContext();
     if (!token) {
@@ -510,6 +572,7 @@ export function createArtifactBoardMcpServer(options = {}) {
         origin,
         tokenSource,
         handle,
+        email: user.email ?? null,
         boardUrl,
         tier: user.tier ?? 'starter',
         quota: {
@@ -652,6 +715,7 @@ export function createArtifactBoardMcpServer(options = {}) {
             'Approved login response did not include an access token.',
           );
         }
+        const existingCreds = extractSavedCredentials(await readJsonFileIfExists(credentialsPath));
         const handle = pollData.handle ?? null;
         await writePrivateJsonFile(credentialsPath, {
           origin: targetOrigin,
@@ -667,6 +731,17 @@ export function createArtifactBoardMcpServer(options = {}) {
           boardUrl: handle ? `${targetOrigin}/${encodeURIComponent(handle)}/boards` : null,
           credentialsPath,
         };
+        if (
+          existingCreds.token &&
+          existingCreds.origin &&
+          existingCreds.token !== pollData.rawToken
+        ) {
+          const revokeResult = await revokeTokenBestEffort(
+            existingCreds.origin,
+            existingCreds.token,
+          );
+          loginResult.previousTokenRevoked = revokeResult.revoked;
+        }
         if (process.env.ARTIFACTBOARD_TOKEN) {
           loginResult.warning =
             'ARTIFACTBOARD_TOKEN is set in your environment and overrides the newly saved credentials file until unset.';
@@ -695,6 +770,64 @@ export function createArtifactBoardMcpServer(options = {}) {
 
       await delay(Math.min(pollIntervalMs, remaining));
     }
+  }
+
+  async function unlinkIfExists(filePath, extraSecrets = []) {
+    try {
+      await unlink(filePath);
+    } catch (err) {
+      if (err && typeof err === 'object' && err.code === 'ENOENT') {
+        return;
+      }
+      throw new ToolExecutionError(
+        'LOGOUT_UNLINK_FAILED',
+        `Unable to remove local credential file "${filePath}": ${sanitizeSecrets(
+          err instanceof Error ? err.message : String(err),
+          extraSecrets,
+        )}`,
+      );
+    }
+  }
+
+  async function handleLogout(args) {
+    if (args.revoke_remote !== undefined && typeof args.revoke_remote !== 'boolean') {
+      throw new ToolExecutionError('INVALID_ARGUMENTS', 'revoke_remote must be a boolean.');
+    }
+    const revokeRemote = args.revoke_remote ?? true;
+    const savedCreds = await readJsonFileIfExists(credentialsPath);
+    const {
+      token: savedToken,
+      origin: savedOrigin,
+      handle: previousHandle,
+    } = extractSavedCredentials(savedCreds);
+
+    let remoteRevoked = false;
+    let remoteWarning = null;
+    if (revokeRemote && savedToken && savedOrigin) {
+      const revokeResult = await revokeTokenBestEffort(savedOrigin, savedToken);
+      remoteRevoked = revokeResult.revoked;
+      if (!revokeResult.revoked && revokeResult.reason) {
+        remoteWarning = revokeResult.reason;
+      }
+    }
+
+    await unlinkIfExists(credentialsPath, savedToken ? [savedToken] : []);
+    await unlinkIfExists(pendingLoginPath);
+
+    return {
+      loggedOut: true,
+      hadCredentials: Boolean(savedToken),
+      previousHandle,
+      remoteRevoked,
+      credentialsPath,
+      ...(remoteWarning ? { remoteWarning } : {}),
+      ...(process.env.ARTIFACTBOARD_TOKEN
+        ? {
+            warning:
+              'ARTIFACTBOARD_TOKEN is set in your environment and remains active until unset.',
+          }
+        : {}),
+    };
   }
 
   async function handleExportDeck(args) {
@@ -753,6 +886,23 @@ export function createArtifactBoardMcpServer(options = {}) {
       throw new ToolExecutionError('INVALID_TITLE', 'title must be a string.');
     }
 
+    let normalizedExpectedHandle = null;
+    if (args.expected_handle !== undefined) {
+      if (typeof args.expected_handle !== 'string') {
+        throw new ToolExecutionError(
+          'INVALID_EXPECTED_HANDLE',
+          'expected_handle must be a string (3-30 lowercase alphanumeric characters or hyphens, with optional leading @).',
+        );
+      }
+      normalizedExpectedHandle = args.expected_handle.trim().replace(/^@/, '').toLowerCase();
+      if (!HANDLE_REGEX.test(normalizedExpectedHandle)) {
+        throw new ToolExecutionError(
+          'INVALID_EXPECTED_HANDLE',
+          'expected_handle must be 3-30 lowercase alphanumeric characters or hyphens, starting and ending with alphanumeric.',
+        );
+      }
+    }
+
     const { origin, token } = await requireAuth();
 
     const htmlBuffer = await readFile(resolvedPath);
@@ -779,6 +929,9 @@ export function createArtifactBoardMcpServer(options = {}) {
     };
     if (args.visibility !== undefined) {
       headers['X-Deck-Visibility'] = args.visibility;
+    }
+    if (normalizedExpectedHandle !== null) {
+      headers['X-Expected-Handle'] = normalizedExpectedHandle;
     }
 
     const data = await requestJson(
@@ -946,6 +1099,9 @@ export function createArtifactBoardMcpServer(options = {}) {
           break;
         case 'artifactboard_delete_deck':
           payload = await handleDeleteDeck(args);
+          break;
+        case 'artifactboard_logout':
+          payload = await handleLogout(args);
           break;
         default:
           return formatToolResult(

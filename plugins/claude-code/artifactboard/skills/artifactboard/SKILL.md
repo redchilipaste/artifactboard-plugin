@@ -22,14 +22,14 @@ Every deck you generate or prepare for ArtifactBoard must satisfy all of the fol
   - Bind `ArrowRight` / `PageDown` / `Space` (when focus is not on an interactive `BUTTON`, `INPUT`, `TEXTAREA`, or `SELECT`) to advance slides.
   - Bind `ArrowLeft` / `PageUp` to go back, `Home` for the first slide, and `End` for the last slide.
   - Optionally support `F` (fullscreen), `G` (slide overview dialog), and `N` or `?` (speaker notes), ignoring keystrokes inside form fields.
-  - When framed, forward hardware clicker shortcuts (`B` / `.` as `'b'` for blackout, plain `F5` with `preventDefault()` as `'f5'` so clickers never reload the tab, and `Escape` as `'escape'` when no deck modal is open).
+  - When framed, forward hardware clicker shortcuts (`B` / `.` as `'b'` for blackout, `Escape` as `'escape'` when no deck modal is open, and plain `F5` as `'f5'`). On plain `F5` when framed, **always** call `event.preventDefault()` unconditionally (even inside inputs or open modals so clickers never reload the iframe), and only forward `{ type: 'shortcut', key: 'f5' }` when focus is outside inputs and no modal is open.
 - **Sandbox & CSP safety (`sandbox="allow-scripts"`, `connect-src 'none'`):**
   - Published decks render inside an opaque-origin `sandbox="allow-scripts"` iframe with `connect-src 'none'`, `base-uri 'none'`, and `form-action 'none'`.
-  - **NEVER call `localStorage`, `sessionStorage`, or `document.cookie` unguarded.** Accessing `localStorage` or `sessionStorage` in an opaque origin throws `SecurityError` and will crash your slide script. Either avoid Web Storage completely or wrap any optional read/write in `try { ... } catch {}`.
+  - **NEVER call `localStorage`, `sessionStorage`, `document.cookie`, `history.pushState`, or `history.replaceState` unguarded.** Calling Web Storage or History state APIs in an opaque origin throws `SecurityError` and will crash your slide script. Either avoid them completely or wrap any optional call in `try { ... } catch {}`.
   - Skip `document.startViewTransition()` when framed (`window.self !== window.top`) or when `prefers-reduced-motion: reduce` is set, preventing cross-origin OOPIF renderer crashes.
   - Do not make `fetch()`, `XMLHttpRequest`, or `WebSocket` calls (blocked by `connect-src 'none'`), and do not rely on `<base>` tags or `<form>` submissions.
 - **Hidden Deck Spec v2 metadata (`<head>`):**
-  - After implementing both the Presenter Mode bridge (`presenter-bridge-v1`) and hardware clicker key forwarding (`pointer-keys-v1`), declare them in `<head>`:
+  - After implementing both the Presenter Mode bridge (`presenter-bridge-v1`) and hardware clicker key forwarding (`pointer-keys-v1`), insert these tags at the **top of `<head>` (before `<style>`, within the first 64 KB of the file)**:
     ```html
     <meta name="artifactboard:deck-spec" content="2">
     <meta name="artifactboard:features" content="presenter-bridge-v1,pointer-keys-v1">
@@ -39,14 +39,14 @@ Every deck you generate or prepare for ArtifactBoard must satisfy all of the fol
 
 To support synced two-tab Presentation Mode (Fullscreen Stage + Speaker Console with live hover/click mirroring):
 
-- **Slide metadata & privacy:** Put `data-title="..."` and `data-notes="..."` on each `.slide` element. **Privacy reminder:** speaker notes in `public` decks live directly in the HTML source—never put secrets, tokens, or passwords in public speaker notes.
+- **Slide metadata & privacy:** Put `data-title="..."` and `data-notes="..."` on each `.slide` element (use an empty `data-notes=""` when a slide has no speaker notes—never invent or fabricate notes). **Privacy reminder:** speaker notes in `public` decks live directly in the HTML source—never put secrets, tokens, or passwords in public speaker notes.
 - **CSS hover mirroring:** Pair interactive `:hover` rules (`.card`, `.flow-node`, `.choice-btn`, `.tab-btn`) with `:is(:hover, [data-ab-hover="true"])` so mirrored Speaker Console hovers animate on the fullscreen stage.
 - **Safe targets & loop guard:** Only target elements inside `.slide.is-active` (ignore outer toolbar buttons). Serialize targets as `{ id?, slideIndex, path }` (safe `id` + child-index `path`), resolve with `document.getElementById` + `activeSlide.children` (never `querySelector` with untrusted strings), and guard replayed DOM actions with `isReplaying = true` inside `try/finally`.
 - **`postMessage` contract (only when framed, validating `event.source === window.parent && event.data?.source === 'artifactboard-host'`):**
   - **Deck → Host (`source: 'artifactboard-deck', version: 1`):**
-    - `state`: `{ type: 'state', origin, index, total, title, notes, nextTitle, nextNotes, slides: [{ index, title }] }`
+    - `state`: `{ type: 'state', origin, index, total, title, notes, nextTitle, nextNotes, slides: [{ index, title }] }` — `index` is **0-based (`0..total - 1`)**, and `origin` is `'init' | 'user' | 'host'` (responding to host commands with `'host'` prevents feedback loops).
     - `shortcut`: `{ type: 'shortcut', key }` (`'f'`, `'f5'`, `'p'`, `'b'` including `.`, `'l'`, `'escape'`)
-    - `interact`: `{ type: 'interact', kind: 'hover' | 'leave' | 'click' | 'input' | 'pointer', target, x?, y?, value?, checked? }`
+    - `interact`: `{ type: 'interact', kind: 'hover' | 'leave' | 'click' | 'input' | 'pointer', target, x?, y?, value?, checked? }` — `pointer` `x`/`y` are normalized `0..1` viewport ratios (`requestAnimationFrame`-throttled).
   - **Host → Deck (`source: 'artifactboard-host', version: 1`):**
     - `cmd`: `{ type: 'cmd', action: 'next' | 'prev' | 'first' | 'last' | 'goto' | 'requestState', index? }`
     - `interact`: `{ type: 'interact', kind: 'hover' | 'leave' | 'click' | 'input', target, value?, checked? }`
@@ -76,7 +76,7 @@ window.addEventListener('message', (event) => {
 
 ## 2. Publishing & Board Management Workflow (MCP Tools)
 
-Always write the deck to a `.html` file on disk first, then use the 8 `artifactboard` MCP tools.
+Always write the deck to a `.html` file on disk first, then use the 9 `artifactboard` MCP tools.
 
 1. **Check authentication & quota:**
    - Call `artifactboard_status()`.
@@ -89,22 +89,25 @@ Always write the deck to a `.html` file on disk first, then use the 8 `artifactb
      3. Call `artifactboard_login({ resume_pending: true, open_browser: true })` to open `/cli/authorize?code=...` (after a brief beat so the chat message is visible first), wait for browser approval, and save the `ab_live_...` token locally with `0600` permissions.
    - To switch accounts, either call `artifactboard_logout()` followed by the two-step `artifactboard_login()` flow, or click **Switch account** on `/cli/authorize` in your browser during login approval.
    - **Security rule:** Never inspect, log, or paste raw `ab_live_...` tokens into chat.
-3. **Export a deck directly from disk (zero LLM token copy):**
+3. **Validate a local deck before exporting:**
+   - Call `artifactboard_validate_deck({ file_path })` on the `.html` file on disk to check UTF-8/size bounds, CSP/sandbox safety, `<meta name="artifactboard:*">` placement, `presenter-bridge-v1`, and `pointer-keys-v1`.
+   - Confirm `valid === true` and `readyForDeckSpecV2 === true` (zero errors) before publishing or re-exporting.
+4. **Export a deck directly from disk (zero LLM token copy):**
    - Call `artifactboard_export_deck({ file_path, title?, slug?, visibility?, expected_handle? })`.
    - **Always pass `file_path` pointing to the `.html` file on disk.** The MCP server streams bytes straight from disk so zero HTML tokens are copied through LLM tool arguments.
    - When the user specifies a target account (e.g., `@handle`), pass `expected_handle` so the upload is rejected if a different account is currently signed in.
    - Default `visibility` is `"private"` unless the user asks for `"unlisted"` or `"public"`.
    - Returns `presentUrl`, `unlistedUrl`, and `boardUrl`.
-4. **List decks on the board:**
+5. **List decks on the board:**
    - Call `artifactboard_list_decks()` to inspect slugs, titles, visibility, sizes, share URLs, and deck spec status (`up_to_date` vs `needs_backfill`, plus `outdatedCount`, `detectedFeatures`, and `missingFeatures`).
-5. **Download a deck straight to disk (zero LLM token copy):**
+6. **Download a deck straight to disk (zero LLM token copy):**
    - Call `artifactboard_download_deck({ slug, output_path, overwrite?, expected_handle? })` to stream a published deck from your board directly to a local `.html` file without copying HTML through LLM tool arguments.
-6. **Update title, visibility, or unlisted link:**
+7. **Update title, visibility, or unlisted link:**
    - Call `artifactboard_update_deck({ slug, title?, visibility?, rotate_unlisted_key? })`.
    - Ideal for switching a deck from `"private"` to `"public"` right before walking on stage, or rotating an `"unlisted"` key.
-7. **Delete a deck:**
+8. **Delete a deck:**
    - Call `artifactboard_delete_deck({ slug })` only when the user explicitly requests removal.
-8. **Sign out:**
+9. **Sign out:**
    - Call `artifactboard_logout({ revoke_remote? })` to revoke the saved CLI token on ArtifactBoard (default `revoke_remote: true`) and remove local credentials from `~/.config/artifactboard/credentials.json`.
 
 To audit and upgrade outdated or legacy decks to Deck Spec v2 without losing content or styling, use the companion `backfill-artifactboard` skill. To check for or pull the latest plugin update, use the companion `update-artifactboard` skill; if setup, sign-in, deck export, sandbox rendering, or Presentation Mode fails, use the companion `troubleshoot-artifactboard` skill to diagnose and resolve the issue.

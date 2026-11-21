@@ -98,6 +98,7 @@ Both direct installers unpack the verified plugin archive into `~/.config/artifa
 | :--- | :--- |
 | `artifactboard_status` | Check local sign-in status, `@handle`, email, board URL, and storage quota |
 | `artifactboard_login` | Run browser-approved device-code sign-in and save credentials locally (`0600`) |
+| `artifactboard_validate_deck` | Validate a local `.html` file against Deck Spec v2, sandbox/CSP safety, and bridge/pointer-key checks before export |
 | `artifactboard_export_deck` | Stream a local `.html` file (`<= 5 MB`) straight from disk to your board (with optional `expected_handle` guard) |
 | `artifactboard_download_deck` | Stream a published deck from your board straight to a local `.html` file on disk (zero LLM token copy) |
 | `artifactboard_list_decks` | List decks on your board with visibility, sizes, share URLs, and Deck Spec v2 status (`up_to_date` / `needs_backfill`) |

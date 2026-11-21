@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
+import vm from 'node:vm';
 
 const DEFAULT_ORIGIN = 'https://artifactboard.com';
 const DEFAULT_PROTOCOL_VERSION = '2024-11-05';
@@ -20,9 +21,9 @@ export const CURRENT_REQUIRED_FEATURES = Object.freeze([
   'presenter-bridge-v1',
   'pointer-keys-v1',
 ]);
-export const SERVER_INFO = Object.freeze({ name: 'artifactboard', version: '1.1.0' });
+export const SERVER_INFO = Object.freeze({ name: 'artifactboard', version: '1.2.0' });
 const SERVER_INSTRUCTIONS =
-  'Author slide decks as a single self-contained .html file (<= 5 MB) with all CSS, JS, and SVG inlined and no external CDN scripts or stylesheets. Published decks render in an origin-isolated sandbox (sandbox="allow-scripts", connect-src \'none\'): guard any localStorage/sessionStorage access in try/catch, avoid fetch()/XHR/WebSocket calls, and skip document.startViewTransition() when framed (window.self !== window.top). Always write the .html deck to disk first, then call artifactboard_export_deck with file_path instead of passing HTML inline. Include Deck Spec v2 hidden <meta> tags in <head> (<meta name="artifactboard:deck-spec" content="2"> and <meta name="artifactboard:features" content="presenter-bridge-v1,pointer-keys-v1">), populate data-title/data-notes on slides, pair CSS hover rules with :is(:hover, [data-ab-hover="true"]), implement the artifactboard-deck / artifactboard-host postMessage bridge, and support hardware presenter keys (., F5, Escape). To download an existing deck directly to disk without spending LLM tokens on raw HTML, call artifactboard_download_deck; to upgrade older decks to Deck Spec v2, consult the companion backfill-artifactboard skill. When authenticating with artifactboard_login, always call it with no arguments first, show the returned userCode (and authorizeUrl fallback link) to the user in chat and let them know a browser confirmation popup is about to open, then call artifactboard_login({ resume_pending: true, open_browser: true }) to launch the browser popup and wait for approval. To pull the latest plugin update, consult the companion update-artifactboard skill; when setup, sign-in, export, sandbox rendering, or Presentation Mode fails, consult the companion troubleshoot-artifactboard skill.';
+  'Author slide decks as a single self-contained .html file (<= 5 MB) with all CSS, JS, and SVG inlined and no external CDN scripts or stylesheets. Published decks render in an origin-isolated sandbox (sandbox="allow-scripts", connect-src \'none\'): guard any localStorage/sessionStorage/document.cookie/history.pushState/history.replaceState access in try/catch, avoid fetch()/XHR/WebSocket calls, and skip document.startViewTransition() when framed (window.self !== window.top). Always write the .html deck to disk first, call artifactboard_validate_deck to verify Deck Spec v2, sandbox/CSP safety, and JS syntax, then call artifactboard_export_deck with file_path instead of passing HTML inline. Place Deck Spec v2 hidden <meta> tags at the top of <head> before large <style> blocks (within the first 64 KB: <meta name="artifactboard:deck-spec" content="2"> and <meta name="artifactboard:features" content="presenter-bridge-v1,pointer-keys-v1">), populate data-title/data-notes on slides, pair CSS hover rules with :is(:hover, [data-ab-hover="true"]), implement the artifactboard-deck / artifactboard-host postMessage bridge, and support hardware presenter keys (., F5, Escape). To download an existing deck directly to disk without spending LLM tokens on raw HTML, call artifactboard_download_deck; to upgrade older decks to Deck Spec v2, consult the companion backfill-artifactboard skill. When authenticating with artifactboard_login, always call it with no arguments first, show the returned userCode (and authorizeUrl fallback link) to the user in chat and let them know a browser confirmation popup is about to open, then call artifactboard_login({ resume_pending: true, open_browser: true }) to launch the browser popup and wait for approval. To pull the latest plugin update, consult the companion update-artifactboard skill; when setup, sign-in, export, sandbox rendering, or Presentation Mode fails, consult the companion troubleshoot-artifactboard skill.';
 
 const MAX_DECK_BYTES = 5_242_880;
 const MAX_TITLE_LENGTH = 140;
@@ -239,6 +240,23 @@ export const TOOLS = Object.freeze([
       additionalProperties: false,
     },
   },
+  {
+    name: 'artifactboard_validate_deck',
+    description:
+      'Validate a local standalone .html/.htm slide deck against ArtifactBoard Deck Spec v2, sandbox/CSP safety, and JS syntax without uploading or returning raw HTML.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        file_path: {
+          type: 'string',
+          description: 'Local file path to a standalone .html or .htm slide deck.',
+          minLength: 1,
+        },
+      },
+      required: ['file_path'],
+      additionalProperties: false,
+    },
+  },
 ]);
 
 const TOOL_NAMES = new Set(TOOLS.map((tool) => tool.name));
@@ -348,10 +366,64 @@ const POINTER_F5_KEY_RE = /['"][Ff]5['"]/;
 const POINTER_PERIOD_KEY_RE = /['"]\.['"]/;
 const POINTER_BLACKOUT_OR_B_RE = /blackout|['"][Bb]['"]/i;
 const HEAD_SCAN_LIMIT_BYTES = 65_536;
-const HEAD_CLOSE_TAG_RE = /<\/head(?:\s|>)/i;
 const META_TAG_RE = /<meta\b([^>]{1,1024})>/gi;
 const META_ATTR_RE =
   /([A-Za-z_:][-A-Za-z0-9_:.]*)\s*(?:=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
+const CLASSIC_JS_SCRIPT_TYPES = new Set([
+  '',
+  'text/javascript',
+  'application/javascript',
+  'text/ecmascript',
+  'application/ecmascript',
+]);
+const NON_SUBRESOURCE_LINK_RELS = new Set([
+  'canonical',
+  'alternate',
+  'author',
+  'license',
+  'help',
+  'prev',
+  'next',
+  'bookmark',
+]);
+const RESOURCE_SRC_TAGS = new Set(['img', 'video', 'audio', 'source', 'iframe']);
+
+function isDisallowedResourceUrl(rawUrl) {
+  const url = String(rawUrl || '').trim();
+  if (!url || url.startsWith('#')) {
+    return false;
+  }
+  const lower = url.toLowerCase();
+  if (lower.startsWith('data:') || lower.startsWith('blob:') || lower === 'about:blank') {
+    return false;
+  }
+  return true;
+}
+const HOST_BRIDGE_MARKER_RE = /['"]artifactboard-host['"]/;
+const PARENT_SOURCE_CHECK_RE =
+  /(?:[A-Za-z_$][\w$]*\.source\s*(?:===|!==)\s*window\.parent|window\.parent\s*(?:===|!==)\s*[A-Za-z_$][\w$]*\.source)/;
+const IS_REPLAYING_RE = /\bisReplaying[A-Za-z0-9_$]*\b/;
+const FRAMING_GUARD_RE = /\b(?:window\.top|window\.parent|isFramed)\b/;
+const VIEW_TRANSITION_RE = /\bstartViewTransition\b/;
+const REGEX_PREFIX_KEYWORDS = new Set([
+  'return',
+  'throw',
+  'case',
+  'default',
+  'delete',
+  'void',
+  'typeof',
+  'in',
+  'instanceof',
+  'new',
+  'else',
+  'do',
+  'yield',
+  'await',
+  'of',
+  'export',
+]);
+const GLOBAL_RECEIVERS = new Set(['window', 'globalThis', 'self']);
 
 function sanitizeDeckSpecVersion(value) {
   if (typeof value === 'number') {
@@ -422,66 +494,117 @@ function isTagNameBoundary(char) {
   );
 }
 
-function findClosingTagEnd(lowerHtml, closePrefix, searchStart) {
+function findClosingTagSpan(lowerHtml, closePrefix, searchStart) {
   let idx = searchStart;
   while (idx < lowerHtml.length) {
     const found = lowerHtml.indexOf(closePrefix, idx);
     if (found === -1) {
-      return lowerHtml.length;
+      return { contentEnd: lowerHtml.length, tagEnd: lowerHtml.length };
     }
     const nextChar = lowerHtml[found + closePrefix.length];
     if (nextChar === undefined || isTagNameBoundary(nextChar)) {
       const gt = lowerHtml.indexOf('>', found + closePrefix.length);
-      return gt === -1 ? lowerHtml.length : gt + 1;
+      return {
+        contentEnd: found,
+        tagEnd: gt === -1 ? lowerHtml.length : gt + 1,
+      };
     }
     idx = found + closePrefix.length;
   }
-  return lowerHtml.length;
+  return { contentEnd: lowerHtml.length, tagEnd: lowerHtml.length };
+}
+
+function findClosingTagEnd(lowerHtml, closePrefix, searchStart) {
+  return findClosingTagSpan(lowerHtml, closePrefix, searchStart).tagEnd;
 }
 
 function toAsciiLower(text) {
   return text.replace(/[A-Z]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) + 32));
 }
 
-function stripCommentsScriptsAndStyles(html) {
-  const lower = toAsciiLower(html);
+/**
+ * Linear-time O(n) head scanner that skips HTML comments, <script>, and <style> blocks,
+ * stops at </head> or <body> (respecting tag boundaries), and caps output at 65,536 chars.
+ * @param {string} rawHtml
+ * @param {number} [maxRawChars]
+ * @param {number} [maxSanitizedChars]
+ * @returns {string}
+ */
+function extractSanitizedHead(
+  rawHtml,
+  maxRawChars = MAX_DECK_BYTES,
+  maxSanitizedChars = HEAD_SCAN_LIMIT_BYTES,
+) {
+  if (typeof rawHtml !== 'string' || rawHtml.length === 0) {
+    return '';
+  }
+  const boundedHtml = rawHtml.length > maxRawChars ? rawHtml.slice(0, maxRawChars) : rawHtml;
+  const lower = toAsciiLower(boundedHtml);
   const parts = [];
+  let collectedLength = 0;
   let pos = 0;
 
-  while (pos < html.length) {
-    const lt = html.indexOf('<', pos);
+  const appendChunk = (chunk) => {
+    if (!chunk || collectedLength >= maxSanitizedChars) {
+      return;
+    }
+    const remaining = maxSanitizedChars - collectedLength;
+    const slice = chunk.length > remaining ? chunk.slice(0, remaining) : chunk;
+    parts.push(slice);
+    collectedLength += slice.length;
+  };
+
+  while (pos < boundedHtml.length && collectedLength < maxSanitizedChars) {
+    const lt = boundedHtml.indexOf('<', pos);
     if (lt === -1) {
-      parts.push(html.slice(pos));
+      appendChunk(boundedHtml.slice(pos));
       break;
     }
     if (lt > pos) {
-      parts.push(html.slice(pos, lt));
+      appendChunk(boundedHtml.slice(pos, lt));
+      if (collectedLength >= maxSanitizedChars) {
+        break;
+      }
     }
 
-    if (html.startsWith('<!--', lt)) {
-      const commentEnd = html.indexOf('-->', lt + 4);
-      parts.push(' ');
+    if (boundedHtml.startsWith('<!--', lt)) {
+      const commentEnd = boundedHtml.indexOf('-->', lt + 4);
+      appendChunk(' ');
       if (commentEnd === -1) {
-        pos = html.length;
         break;
       }
       pos = commentEnd + 3;
       continue;
     }
 
-    if (lower.startsWith('<script', lt) && isTagNameBoundary(lower[lt + 7])) {
-      parts.push(' ');
+    if (
+      lower.startsWith('<script', lt) &&
+      (lower[lt + 7] === undefined || isTagNameBoundary(lower[lt + 7]))
+    ) {
+      appendChunk(' ');
       pos = findClosingTagEnd(lower, '</script', lt + 7);
       continue;
     }
 
-    if (lower.startsWith('<style', lt) && isTagNameBoundary(lower[lt + 6])) {
-      parts.push(' ');
+    if (
+      lower.startsWith('<style', lt) &&
+      (lower[lt + 6] === undefined || isTagNameBoundary(lower[lt + 6]))
+    ) {
+      appendChunk(' ');
       pos = findClosingTagEnd(lower, '</style', lt + 6);
       continue;
     }
 
-    parts.push('<');
+    if (
+      (lower.startsWith('</head', lt) &&
+        (lower[lt + 6] === undefined || isTagNameBoundary(lower[lt + 6]))) ||
+      (lower.startsWith('<body', lt) &&
+        (lower[lt + 5] === undefined || isTagNameBoundary(lower[lt + 5])))
+    ) {
+      break;
+    }
+
+    appendChunk('<');
     pos = lt + 1;
   }
 
@@ -505,6 +628,36 @@ function parseMetaAttributes(attrText) {
   return { name, content };
 }
 
+function parseDeckMetaFromSanitizedHead(sanitizedHead) {
+  let version = null;
+  let features = [];
+  if (!sanitizedHead) {
+    return { version, features };
+  }
+
+  META_TAG_RE.lastIndex = 0;
+  let tagMatch;
+  while ((tagMatch = META_TAG_RE.exec(sanitizedHead)) !== null) {
+    const { name, content } = parseMetaAttributes(tagMatch[1]);
+    if (!name) {
+      continue;
+    }
+    const normalizedName = name.trim().toLowerCase();
+    if (normalizedName === 'artifactboard:deck-spec') {
+      if (version === null) {
+        version = sanitizeDeckSpecVersion(content);
+      }
+    } else if (normalizedName === 'artifactboard:features') {
+      const parsed = sanitizeDeckFeatures(content);
+      if (parsed.length > 0) {
+        features = sanitizeDeckFeatures([...features, ...parsed]);
+      }
+    }
+  }
+
+  return { version, features };
+}
+
 /**
  * Inspects standalone deck HTML for Deck Spec v2 <meta> tags and legacy feature hints.
  * Mirrors extractDeckMetadata + evaluateDeckSpecStatus without external imports.
@@ -517,44 +670,8 @@ export function inspectDeckHtmlMetadata(htmlInput) {
       ? htmlInput
       : '';
   const detectedFeatures = sanitizeDeckFeatures(detectLegacyDeckFeatures(fullText));
-
-  let boundedSlice = '';
-  if (Buffer.isBuffer(htmlInput)) {
-    boundedSlice = htmlInput.subarray(0, HEAD_SCAN_LIMIT_BYTES).toString('utf8');
-  } else if (typeof htmlInput === 'string') {
-    boundedSlice = htmlInput.slice(0, HEAD_SCAN_LIMIT_BYTES);
-  }
-
-  let version = null;
-  let features = [];
-
-  if (boundedSlice) {
-    const strippedSlice = stripCommentsScriptsAndStyles(boundedSlice);
-    const headCloseMatch = HEAD_CLOSE_TAG_RE.exec(strippedSlice);
-    const sanitizedHead = headCloseMatch
-      ? strippedSlice.slice(0, headCloseMatch.index)
-      : strippedSlice;
-
-    META_TAG_RE.lastIndex = 0;
-    let tagMatch;
-    while ((tagMatch = META_TAG_RE.exec(sanitizedHead)) !== null) {
-      const { name, content } = parseMetaAttributes(tagMatch[1]);
-      if (!name) {
-        continue;
-      }
-      const normalizedName = name.trim().toLowerCase();
-      if (normalizedName === 'artifactboard:deck-spec') {
-        if (version === null) {
-          version = sanitizeDeckSpecVersion(content);
-        }
-      } else if (normalizedName === 'artifactboard:features') {
-        const parsed = sanitizeDeckFeatures(content);
-        if (parsed.length > 0) {
-          features = sanitizeDeckFeatures([...features, ...parsed]);
-        }
-      }
-    }
-  }
+  const sanitizedHead = extractSanitizedHead(fullText);
+  const { version, features } = parseDeckMetaFromSanitizedHead(sanitizedHead);
 
   const missingFromDeclared = CURRENT_REQUIRED_FEATURES.filter(
     (feature) => !features.includes(feature),
@@ -576,6 +693,877 @@ export function inspectDeckHtmlMetadata(htmlInput) {
     missingFeatures,
     exportedWithVersion: null,
     exportedVia: null,
+  };
+}
+
+function isAsciiAlpha(char) {
+  return char !== undefined && ((char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z'));
+}
+
+function isTagNameChar(char) {
+  return (
+    char !== undefined &&
+    (isAsciiAlpha(char) || (char >= '0' && char <= '9') || char === '-' || char === ':')
+  );
+}
+
+function findTagOpenEnd(html, startIndex) {
+  let quote = '';
+  for (let idx = startIndex; idx < html.length; idx += 1) {
+    const ch = html[idx];
+    if (quote) {
+      if (ch === quote) {
+        quote = '';
+      }
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+    } else if (ch === '>') {
+      return idx;
+    }
+  }
+  return -1;
+}
+
+function parseTagAttributes(attrText) {
+  const attrs = new Map();
+  META_ATTR_RE.lastIndex = 0;
+  let match;
+  while ((match = META_ATTR_RE.exec(attrText)) !== null) {
+    const attrName = match[1].toLowerCase();
+    const attrValue = match[2] ?? match[3] ?? match[4] ?? '';
+    if (!attrs.has(attrName)) {
+      attrs.set(attrName, attrValue);
+    }
+  }
+  return attrs;
+}
+
+function scanDeckHtmlStructures(html) {
+  const lower = toAsciiLower(html);
+  const inlineScripts = [];
+  const styleBlocks = [];
+  const externalResources = [];
+  let slideCount = 0;
+  let dataTitleCount = 0;
+  let dataNotesCount = 0;
+  let pos = 0;
+
+  while (pos < html.length) {
+    const lt = html.indexOf('<', pos);
+    if (lt === -1) {
+      break;
+    }
+
+    if (html.startsWith('<!--', lt)) {
+      const commentEnd = html.indexOf('-->', lt + 4);
+      if (commentEnd === -1) {
+        break;
+      }
+      pos = commentEnd + 3;
+      continue;
+    }
+
+    if (!isAsciiAlpha(html[lt + 1])) {
+      pos = lt + 1;
+      continue;
+    }
+
+    let nameEnd = lt + 2;
+    while (nameEnd < html.length && isTagNameChar(html[nameEnd])) {
+      nameEnd += 1;
+    }
+    if (!isTagNameBoundary(lower[nameEnd])) {
+      pos = lt + 1;
+      continue;
+    }
+
+    const tagName = lower.slice(lt + 1, nameEnd);
+    const tagOpenEnd = findTagOpenEnd(html, nameEnd);
+    if (tagOpenEnd === -1) {
+      break;
+    }
+
+    const attrs = parseTagAttributes(html.slice(nameEnd, tagOpenEnd));
+
+    if (tagName === 'script') {
+      const { contentEnd, tagEnd } = findClosingTagSpan(lower, '</script', tagOpenEnd + 1);
+      if (attrs.has('src')) {
+        const srcUrl = (attrs.get('src') ?? '').trim();
+        if (isDisallowedResourceUrl(srcUrl)) {
+          externalResources.push({ tag: 'script', attr: 'src', url: srcUrl });
+        }
+      } else {
+        const rawType = (attrs.get('type') ?? '').trim().toLowerCase().split(';')[0].trim();
+        inlineScripts.push({
+          type: rawType,
+          content: html.slice(tagOpenEnd + 1, contentEnd),
+        });
+      }
+      pos = tagEnd;
+      continue;
+    }
+
+    if (tagName === 'style') {
+      const { contentEnd, tagEnd } = findClosingTagSpan(lower, '</style', tagOpenEnd + 1);
+      styleBlocks.push(html.slice(tagOpenEnd + 1, contentEnd));
+      pos = tagEnd;
+      continue;
+    }
+
+    if (tagName === 'link') {
+      const relTokens = (attrs.get('rel') ?? '')
+        .trim()
+        .toLowerCase()
+        .split(/\s+/)
+        .filter(Boolean);
+      const isNonSubresource =
+        relTokens.length > 0 && relTokens.every((token) => NON_SUBRESOURCE_LINK_RELS.has(token));
+      const hrefUrl = (attrs.get('href') ?? '').trim();
+      if (!isNonSubresource && isDisallowedResourceUrl(hrefUrl)) {
+        externalResources.push({ tag: 'link', attr: 'href', url: hrefUrl });
+      }
+    } else if (RESOURCE_SRC_TAGS.has(tagName)) {
+      const srcUrl = (attrs.get('src') ?? '').trim();
+      if (isDisallowedResourceUrl(srcUrl)) {
+        externalResources.push({ tag: tagName, attr: 'src', url: srcUrl });
+      }
+    }
+
+    const classTokens = (attrs.get('class') ?? '')
+      .trim()
+      .toLowerCase()
+      .split(/\s+/)
+      .filter(Boolean);
+    if (classTokens.includes('slide') || attrs.has('data-slide')) {
+      slideCount += 1;
+      if (attrs.has('data-title') && attrs.get('data-title').trim().length > 0) {
+        dataTitleCount += 1;
+      }
+      if (attrs.has('data-notes')) {
+        dataNotesCount += 1;
+      }
+    }
+
+    pos = tagOpenEnd + 1;
+  }
+
+  return {
+    inlineScripts,
+    styleBlocks,
+    externalResources,
+    slideCount,
+    dataTitleCount,
+    dataNotesCount,
+  };
+}
+
+function isJsIdentStart(char) {
+  return (
+    char !== undefined &&
+    ((char >= 'a' && char <= 'z') ||
+      (char >= 'A' && char <= 'Z') ||
+      char === '_' ||
+      char === '$')
+  );
+}
+
+function isJsIdentPart(char) {
+  return isJsIdentStart(char) || (char !== undefined && char >= '0' && char <= '9');
+}
+
+function analyzeJsCode(code) {
+  const noCommentParts = [];
+  const strippedParts = [];
+  const templateBraceStack = [];
+  let braceDepth = 0;
+  let inTemplateText = false;
+  let expectRegex = true;
+  let prevSignificantChar = '';
+  let i = 0;
+
+  while (i < code.length) {
+    const ch = code[i];
+
+    if (inTemplateText) {
+      if (ch === '\\' && i + 1 < code.length) {
+        const escaped = code.slice(i, i + 2);
+        noCommentParts.push(escaped);
+        if (code[i + 1] === '\n') {
+          strippedParts.push('\n');
+        }
+        i += 2;
+        continue;
+      }
+      if (ch === '$' && code[i + 1] === '{') {
+        templateBraceStack.push(braceDepth);
+        braceDepth += 1;
+        noCommentParts.push('${');
+        strippedParts.push('${');
+        inTemplateText = false;
+        expectRegex = true;
+        prevSignificantChar = '{';
+        i += 2;
+        continue;
+      }
+      if (ch === '`') {
+        noCommentParts.push('`');
+        strippedParts.push('`');
+        inTemplateText = false;
+        expectRegex = false;
+        prevSignificantChar = '`';
+        i += 1;
+        continue;
+      }
+      noCommentParts.push(ch);
+      if (ch === '\n') {
+        strippedParts.push('\n');
+      }
+      i += 1;
+      continue;
+    }
+
+    if (ch === ' ' || ch === '\t' || ch === '\r' || ch === '\n') {
+      noCommentParts.push(ch);
+      strippedParts.push(ch);
+      i += 1;
+      continue;
+    }
+
+    if (ch === '/' && code[i + 1] === '/') {
+      const nl = code.indexOf('\n', i + 2);
+      noCommentParts.push(' ');
+      strippedParts.push(' ');
+      if (nl === -1) {
+        break;
+      }
+      i = nl;
+      continue;
+    }
+
+    if (ch === '/' && code[i + 1] === '*') {
+      const end = code.indexOf('*/', i + 2);
+      noCommentParts.push(' ');
+      strippedParts.push(' ');
+      if (end === -1) {
+        break;
+      }
+      i = end + 2;
+      continue;
+    }
+
+    if (ch === '/' && expectRegex) {
+      let end = i + 1;
+      let inCharClass = false;
+      let closed = false;
+      while (end < code.length) {
+        const rc = code[end];
+        if (rc === '\n' || rc === '\r') {
+          break;
+        }
+        if (rc === '\\' && end + 1 < code.length) {
+          end += 2;
+          continue;
+        }
+        if (rc === '[') {
+          inCharClass = true;
+        } else if (rc === ']') {
+          inCharClass = false;
+        } else if (rc === '/' && !inCharClass) {
+          end += 1;
+          while (end < code.length && isAsciiAlpha(code[end])) {
+            end += 1;
+          }
+          closed = true;
+          break;
+        }
+        end += 1;
+      }
+      if (closed) {
+        noCommentParts.push(code.slice(i, end));
+        strippedParts.push('/ /');
+        expectRegex = false;
+        prevSignificantChar = '/';
+        i = end;
+        continue;
+      }
+    }
+
+    if (ch === '"' || ch === "'") {
+      let end = i + 1;
+      while (end < code.length) {
+        const sc = code[end];
+        if (sc === '\\' && end + 1 < code.length) {
+          end += 2;
+          continue;
+        }
+        if (sc === ch) {
+          end += 1;
+          break;
+        }
+        end += 1;
+      }
+      noCommentParts.push(code.slice(i, end));
+      strippedParts.push(`${ch}${ch}`);
+      expectRegex = false;
+      prevSignificantChar = ch;
+      i = end;
+      continue;
+    }
+
+    if (ch === '`') {
+      noCommentParts.push('`');
+      strippedParts.push('`');
+      inTemplateText = true;
+      i += 1;
+      continue;
+    }
+
+    if (ch === '{') {
+      braceDepth += 1;
+      noCommentParts.push('{');
+      strippedParts.push('{');
+      expectRegex = true;
+      prevSignificantChar = '{';
+      i += 1;
+      continue;
+    }
+
+    if (ch === '}') {
+      braceDepth = Math.max(0, braceDepth - 1);
+      noCommentParts.push('}');
+      strippedParts.push('}');
+      if (
+        templateBraceStack.length > 0 &&
+        braceDepth === templateBraceStack[templateBraceStack.length - 1]
+      ) {
+        templateBraceStack.pop();
+        inTemplateText = true;
+      } else {
+        expectRegex = true;
+        prevSignificantChar = '}';
+      }
+      i += 1;
+      continue;
+    }
+
+    if (isJsIdentStart(ch)) {
+      let end = i + 1;
+      while (end < code.length && isJsIdentPart(code[end])) {
+        end += 1;
+      }
+      const ident = code.slice(i, end);
+      noCommentParts.push(ident);
+      strippedParts.push(ident);
+      expectRegex = prevSignificantChar !== '.' && REGEX_PREFIX_KEYWORDS.has(ident);
+      prevSignificantChar = ident[ident.length - 1];
+      i = end;
+      continue;
+    }
+
+    if (ch >= '0' && ch <= '9') {
+      let end = i + 1;
+      while (end < code.length && (isJsIdentPart(code[end]) || code[end] === '.')) {
+        end += 1;
+      }
+      const num = code.slice(i, end);
+      noCommentParts.push(num);
+      strippedParts.push(num);
+      expectRegex = false;
+      prevSignificantChar = num[num.length - 1];
+      i = end;
+      continue;
+    }
+
+    if ((ch === '+' || ch === '-') && code[i + 1] === ch) {
+      const op = code.slice(i, i + 2);
+      noCommentParts.push(op);
+      strippedParts.push(op);
+      expectRegex = false;
+      prevSignificantChar = ch;
+      i += 2;
+      continue;
+    }
+
+    noCommentParts.push(ch);
+    strippedParts.push(ch);
+    expectRegex = ch !== ')' && ch !== ']';
+    prevSignificantChar = ch;
+    i += 1;
+  }
+
+  return {
+    codeWithoutComments: noCommentParts.join(''),
+    strippedCode: strippedParts.join(''),
+  };
+}
+
+function skipWsIndex(text, startIdx) {
+  let idx = startIdx;
+  while (
+    idx < text.length &&
+    (text[idx] === ' ' || text[idx] === '\t' || text[idx] === '\r' || text[idx] === '\n')
+  ) {
+    idx += 1;
+  }
+  return idx;
+}
+
+function scanStrippedJsForSecurity(strippedCode) {
+  const networkApis = new Set();
+  const unguardedSandboxApis = new Set();
+  const tryBraceDepths = [];
+  let braceDepth = 0;
+  let prevSignificantChar = '';
+  let dotOwner = '';
+  let lastIdent = '';
+  let lastIdentIsGlobalRoot = false;
+  let i = 0;
+
+  while (i < strippedCode.length) {
+    const ch = strippedCode[i];
+
+    if (ch === ' ' || ch === '\t' || ch === '\r' || ch === '\n') {
+      i += 1;
+      continue;
+    }
+
+    if (ch === '{') {
+      braceDepth += 1;
+      prevSignificantChar = '{';
+      dotOwner = '';
+      lastIdent = '';
+      lastIdentIsGlobalRoot = false;
+      i += 1;
+      continue;
+    }
+
+    if (ch === '}') {
+      if (tryBraceDepths.length > 0 && tryBraceDepths[tryBraceDepths.length - 1] === braceDepth) {
+        tryBraceDepths.pop();
+      }
+      braceDepth = Math.max(0, braceDepth - 1);
+      prevSignificantChar = '}';
+      dotOwner = '';
+      lastIdent = '';
+      lastIdentIsGlobalRoot = false;
+      i += 1;
+      continue;
+    }
+
+    if (ch === '.') {
+      dotOwner = lastIdentIsGlobalRoot ? lastIdent : '';
+      prevSignificantChar = '.';
+      i += 1;
+      continue;
+    }
+
+    if (isJsIdentStart(ch)) {
+      let end = i + 1;
+      while (end < strippedCode.length && isJsIdentPart(strippedCode[end])) {
+        end += 1;
+      }
+      const ident = strippedCode.slice(i, end);
+      const isPropertyAccess = prevSignificantChar === '.';
+      const owner = isPropertyAccess ? dotOwner : '';
+      const isTopOrGlobalReceiver = !isPropertyAccess || GLOBAL_RECEIVERS.has(owner);
+
+      if (!isPropertyAccess && ident === 'try') {
+        const afterWs = skipWsIndex(strippedCode, end);
+        if (strippedCode[afterWs] === '{') {
+          braceDepth += 1;
+          tryBraceDepths.push(braceDepth);
+          prevSignificantChar = '{';
+          dotOwner = '';
+          lastIdent = '';
+          lastIdentIsGlobalRoot = false;
+          i = afterWs + 1;
+          continue;
+        }
+      }
+
+      if (isTopOrGlobalReceiver && ident === 'fetch') {
+        const afterWs = skipWsIndex(strippedCode, end);
+        if (strippedCode[afterWs] === '(') {
+          networkApis.add('fetch(');
+        }
+      } else if (!isPropertyAccess && ident === 'new') {
+        const newTargetMatch = /^\s+(?:(?:window|globalThis|self)\s*\.\s*)?(XMLHttpRequest|WebSocket)\b/.exec(
+          strippedCode.slice(end),
+        );
+        if (newTargetMatch) {
+          networkApis.add(`new ${newTargetMatch[1]}`);
+        }
+      }
+
+      const isObjectPropertyKey =
+        !isPropertyAccess &&
+        (prevSignificantChar === '{' || prevSignificantChar === ',') &&
+        strippedCode[skipWsIndex(strippedCode, end)] === ':';
+
+      if (tryBraceDepths.length === 0 && isTopOrGlobalReceiver && !isObjectPropertyKey) {
+        if (ident === 'localStorage' || ident === 'sessionStorage') {
+          unguardedSandboxApis.add(ident);
+        } else if (ident === 'document') {
+          if (/^\s*\.\s*cookie\b/.test(strippedCode.slice(end))) {
+            unguardedSandboxApis.add('document.cookie');
+          }
+        } else if (ident === 'history') {
+          const historyMatch = /^\s*\.\s*(pushState|replaceState)\b/.exec(
+            strippedCode.slice(end),
+          );
+          if (historyMatch) {
+            unguardedSandboxApis.add(`history.${historyMatch[1]}`);
+          }
+        }
+      }
+
+      lastIdent = ident;
+      lastIdentIsGlobalRoot = !isPropertyAccess && GLOBAL_RECEIVERS.has(ident);
+      prevSignificantChar = ident[ident.length - 1];
+      dotOwner = '';
+      i = end;
+      continue;
+    }
+
+    prevSignificantChar = ch;
+    dotOwner = '';
+    lastIdent = '';
+    lastIdentIsGlobalRoot = false;
+    i += 1;
+  }
+
+  return {
+    networkApis: [...networkApis],
+    unguardedSandboxApis: [...unguardedSandboxApis],
+  };
+}
+
+function findBalancedParenEnd(code, openParenIndex) {
+  let depth = 1;
+  let i = openParenIndex + 1;
+  let prevNonWs = '(';
+  while (i < code.length) {
+    const ch = code[i];
+    if (ch === ' ' || ch === '\t' || ch === '\r' || ch === '\n') {
+      i += 1;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') {
+      i += 1;
+      while (i < code.length) {
+        if (code[i] === '\\' && i + 1 < code.length) {
+          i += 2;
+          continue;
+        }
+        if (code[i] === ch) {
+          i += 1;
+          break;
+        }
+        i += 1;
+      }
+      prevNonWs = ch;
+      continue;
+    }
+    if (ch === '/' && '=(,!?{;:&|^[-+*%~<>'.includes(prevNonWs)) {
+      let end = i + 1;
+      let inClass = false;
+      let closed = false;
+      while (end < code.length) {
+        const rc = code[end];
+        if (rc === '\n' || rc === '\r') break;
+        if (rc === '\\' && end + 1 < code.length) {
+          end += 2;
+          continue;
+        }
+        if (rc === '[') inClass = true;
+        else if (rc === ']') inClass = false;
+        else if (rc === '/' && !inClass) {
+          end += 1;
+          while (end < code.length && isAsciiAlpha(code[end])) end += 1;
+          closed = true;
+          break;
+        }
+        end += 1;
+      }
+      if (closed) {
+        i = end;
+        prevNonWs = '/';
+        continue;
+      }
+    }
+    if (ch === '(') {
+      depth += 1;
+    } else if (ch === ')') {
+      depth -= 1;
+      if (depth === 0) {
+        return i;
+      }
+    }
+    prevNonWs = ch;
+    i += 1;
+  }
+  return code.length;
+}
+
+function extractAddEventListenerCalls(jsNoComments, targetEvent) {
+  const calls = [];
+  const listenerRe = /\baddEventListener\s*\(/g;
+  let match;
+  while ((match = listenerRe.exec(jsNoComments)) !== null) {
+    const openParenIdx = match.index + match[0].length - 1;
+    const closeParenIdx = findBalancedParenEnd(jsNoComments, openParenIdx);
+    const argsText = jsNoComments.slice(openParenIdx + 1, closeParenIdx);
+    const eventMatch = /^\s*(['"])([A-Za-z0-9_:-]+)\1\s*,/.exec(argsText);
+    if (eventMatch && eventMatch[2] === targetEvent) {
+      calls.push(argsText);
+    }
+  }
+  return calls;
+}
+
+/**
+ * Validates standalone deck HTML against Deck Spec v2, sandbox/CSP safety, and JS syntax
+ * without executing any deck JavaScript or returning raw HTML.
+ * @param {Buffer | string} htmlInput
+ */
+export function validateDeckHtml(htmlInput) {
+  const rawBuffer = Buffer.isBuffer(htmlInput)
+    ? htmlInput
+    : typeof htmlInput === 'string'
+      ? Buffer.from(htmlInput, 'utf8')
+      : Buffer.alloc(0);
+  const sizeBytes = rawBuffer.byteLength;
+  const sha256 = crypto.createHash('sha256').update(rawBuffer).digest('hex');
+
+  const errors = [];
+  const warnings = [];
+
+  if (sizeBytes < 1 || sizeBytes > MAX_DECK_BYTES) {
+    errors.push({
+      code: 'INVALID_FILE_SIZE',
+      message: `Deck file size must be between 1 and ${MAX_DECK_BYTES} bytes (got ${sizeBytes} bytes).`,
+    });
+  }
+
+  let decodedHtml = '';
+  let utf8Valid = true;
+  if (Buffer.isBuffer(htmlInput)) {
+    try {
+      decodedHtml = new TextDecoder('utf-8', { fatal: true }).decode(rawBuffer);
+    } catch {
+      utf8Valid = false;
+      errors.push({
+        code: 'INVALID_UTF8',
+        message: 'Deck file is not valid UTF-8.',
+      });
+    }
+  } else if (typeof htmlInput === 'string') {
+    decodedHtml = htmlInput;
+  }
+
+  if (errors.length > 0 || !utf8Valid) {
+    const emptyDeckSpec = inspectDeckHtmlMetadata('');
+    return {
+      valid: false,
+      readyForDeckSpecV2: false,
+      sizeBytes,
+      sha256,
+      deckSpec: emptyDeckSpec,
+      checks: {
+        metaWithinFirst64Kb: false,
+        inlineScriptCount: 0,
+        presenterBridgeDetected: false,
+        parentSourceChecked: false,
+        isReplayingGuarded: false,
+        pointerKeysDetected: false,
+        slideCount: 0,
+        dataTitleCount: 0,
+        dataNotesCount: 0,
+      },
+      errors,
+      warnings,
+    };
+  }
+
+  const deckSpec = inspectDeckHtmlMetadata(rawBuffer);
+  const first64KbSlice = rawBuffer.subarray(0, HEAD_SCAN_LIMIT_BYTES).toString('utf8');
+  const first64KbMeta = parseDeckMetaFromSanitizedHead(
+    extractSanitizedHead(first64KbSlice, HEAD_SCAN_LIMIT_BYTES, HEAD_SCAN_LIMIT_BYTES),
+  );
+  const metaWithinFirst64Kb = first64KbMeta.version !== null;
+  if (deckSpec.version !== null && !metaWithinFirst64Kb) {
+    warnings.push({
+      code: 'META_AFTER_64KB',
+      message:
+        'Deck Spec <meta> tags appear after the first 64 KB of <head> (likely behind a large <style> block). Place them at the top of <head> for fast header scanning.',
+    });
+  }
+
+  const {
+    inlineScripts,
+    styleBlocks,
+    externalResources,
+    slideCount,
+    dataTitleCount,
+    dataNotesCount,
+  } = scanDeckHtmlStructures(decodedHtml);
+
+  for (const resource of externalResources) {
+    errors.push({
+      code: 'EXTERNAL_RESOURCE',
+      message: `Disallowed external or relative URL in <${resource.tag} ${resource.attr}="${resource.url.slice(0, 120)}">. All scripts, styles, and media must be inlined.`,
+    });
+  }
+
+  const jsNoCommentBlocks = [];
+  const strippedJsBlocks = [];
+
+  for (let idx = 0; idx < inlineScripts.length; idx += 1) {
+    const script = inlineScripts[idx];
+    const scriptNumber = idx + 1;
+
+    if (script.type === 'module') {
+      warnings.push({
+        code: 'MODULE_SCRIPT_SKIPPED',
+        message: `Inline <script type="module"> (#${scriptNumber}) was skipped by classic vm.Script syntax validation.`,
+      });
+    } else if (!CLASSIC_JS_SCRIPT_TYPES.has(script.type)) {
+      continue;
+    } else {
+      try {
+        new vm.Script(script.content);
+      } catch (err) {
+        errors.push({
+          code: 'JS_SYNTAX_ERROR',
+          message: `Inline script #${scriptNumber} has a JavaScript syntax error: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
+    }
+
+    const { codeWithoutComments, strippedCode } = analyzeJsCode(script.content);
+    jsNoCommentBlocks.push(codeWithoutComments);
+    strippedJsBlocks.push(strippedCode);
+
+    const { networkApis, unguardedSandboxApis } = scanStrippedJsForSecurity(strippedCode);
+    for (const api of networkApis) {
+      errors.push({
+        code: 'FORBIDDEN_NETWORK_API',
+        message: `Forbidden network API "${api}" detected in inline script #${scriptNumber} (published decks run with connect-src 'none').`,
+      });
+    }
+    for (const api of unguardedSandboxApis) {
+      errors.push({
+        code: 'UNGUARDED_SANDBOX_API',
+        message: `Unguarded "${api}" access outside a try/catch block in inline script #${scriptNumber} (throws SecurityError in opaque-origin sandbox).`,
+      });
+    }
+
+    if (VIEW_TRANSITION_RE.test(strippedCode) && !FRAMING_GUARD_RE.test(strippedCode)) {
+      errors.push({
+        code: 'UNGUARDED_VIEW_TRANSITION',
+        message: `document.startViewTransition() in inline script #${scriptNumber} lacks a framing guard (window.top, window.parent, or isFramed).`,
+      });
+    }
+  }
+
+  const combinedJsNoComments = jsNoCommentBlocks.join('\n');
+  const combinedStrippedJs = strippedJsBlocks.join('\n');
+
+  const hasDeckMarker = PRESENTER_BRIDGE_MARKER_RE.test(combinedJsNoComments);
+  const hasHostMarker = HOST_BRIDGE_MARKER_RE.test(combinedJsNoComments);
+  const presenterBridgeDetected =
+    hasDeckMarker && combinedJsNoComments.includes('postMessage') && hasHostMarker;
+  const parentSourceChecked = PARENT_SOURCE_CHECK_RE.test(combinedStrippedJs);
+  const isReplayingGuarded = IS_REPLAYING_RE.test(combinedStrippedJs);
+  const pointerKeysDetected =
+    POINTER_F5_KEY_RE.test(combinedJsNoComments) &&
+    POINTER_PERIOD_KEY_RE.test(combinedJsNoComments) &&
+    POINTER_BLACKOUT_OR_B_RE.test(combinedJsNoComments);
+
+  const messageBridgeListeners = extractAddEventListenerCalls(
+    combinedJsNoComments,
+    'message',
+  ).filter((body) => HOST_BRIDGE_MARKER_RE.test(body)).length;
+  if (messageBridgeListeners > 1) {
+    warnings.push({
+      code: 'DUPLICATE_MESSAGE_LISTENER',
+      message: `Detected ${messageBridgeListeners} addEventListener('message', ...) handlers referencing artifactboard-host.`,
+    });
+  }
+
+  const keydownBridgeListeners = extractAddEventListenerCalls(
+    combinedJsNoComments,
+    'keydown',
+  ).filter(
+    (body) =>
+      PRESENTER_BRIDGE_MARKER_RE.test(body) ||
+      (hasDeckMarker && /\b(?:postToHost|postMessage)\b/.test(body)),
+  ).length;
+  if (keydownBridgeListeners > 1) {
+    warnings.push({
+      code: 'DUPLICATE_KEYDOWN_LISTENER',
+      message: `Detected ${keydownBridgeListeners} addEventListener('keydown', ...) handlers referencing artifactboard-deck.`,
+    });
+  }
+
+  const strippedCss = styleBlocks.join('\n').replace(/\/\*[\s\S]*?\*\//g, ' ');
+  const hasCssHover = /:hover(?![A-Za-z0-9_-])/i.test(strippedCss);
+  if (hasCssHover && !strippedCss.includes('data-ab-hover')) {
+    warnings.push({
+      code: 'UNMIRRORED_HOVER_CSS',
+      message:
+        'Stylesheet uses :hover selectors without [data-ab-hover="true"] pairing for Speaker Console hover mirroring.',
+    });
+  }
+
+  if (presenterBridgeDetected && !parentSourceChecked) {
+    warnings.push({
+      code: 'MISSING_PARENT_SOURCE_CHECK',
+      message:
+        'Presenter bridge message listener should validate event.source === window.parent.',
+    });
+  }
+  if (presenterBridgeDetected && !isReplayingGuarded) {
+    warnings.push({
+      code: 'MISSING_REPLAY_GUARD',
+      message:
+        'Presenter bridge interact replay should guard against feedback loops with an isReplaying flag.',
+    });
+  }
+
+  if (slideCount > 0 && (dataTitleCount === 0 || dataNotesCount === 0)) {
+    const missingAttrs = [];
+    if (dataTitleCount === 0) missingAttrs.push('data-title');
+    if (dataNotesCount === 0) missingAttrs.push('data-notes');
+    warnings.push({
+      code: 'MISSING_SLIDE_METADATA',
+      message: `Found ${slideCount} slides missing ${missingAttrs.join(' and ')} attributes (use empty data-notes="" if no speaker notes exist).`,
+    });
+  }
+
+  const valid = errors.length === 0;
+  const readyForDeckSpecV2 =
+    valid && deckSpec.upToDate && presenterBridgeDetected && pointerKeysDetected;
+
+  return {
+    valid,
+    readyForDeckSpecV2,
+    sizeBytes,
+    sha256,
+    deckSpec,
+    checks: {
+      metaWithinFirst64Kb,
+      inlineScriptCount: inlineScripts.length,
+      presenterBridgeDetected,
+      parentSourceChecked,
+      isReplayingGuarded,
+      pointerKeysDetected,
+      slideCount,
+      dataTitleCount,
+      dataNotesCount,
+    },
+    errors,
+    warnings,
   };
 }
 
@@ -720,7 +1708,7 @@ export function normalizeMcpClientAgent(name) {
 }
 
 /**
- * Create an ArtifactBoard MCP server instance exposing the 8 deck/auth tools.
+ * Create an ArtifactBoard MCP server instance exposing the 9 deck/auth tools.
  * @param {object} [options]
  * @param {string} [options.origin]
  * @param {string} [options.credentialsPath]
@@ -1470,12 +2458,12 @@ export function createArtifactBoardMcpServer(options = {}) {
     };
   }
 
-  async function handleExportDeck(args) {
-    if (typeof args.file_path !== 'string' || args.file_path.trim().length === 0) {
+  async function statLocalDeckFile(rawFilePath) {
+    if (typeof rawFilePath !== 'string' || rawFilePath.trim().length === 0) {
       throw new ToolExecutionError('INVALID_ARGUMENTS', 'file_path must be a non-empty string.');
     }
 
-    const resolvedPath = path.resolve(args.file_path);
+    const resolvedPath = path.resolve(rawFilePath);
     const ext = path.extname(resolvedPath).toLowerCase();
     if (!ALLOWED_HTML_EXTENSIONS.has(ext)) {
       throw new ToolExecutionError(
@@ -1504,6 +2492,32 @@ export function createArtifactBoardMcpServer(options = {}) {
       );
     }
 
+    return { resolvedPath, ext };
+  }
+
+  async function readLocalDeckBytes(resolvedPath) {
+    const htmlBuffer = await readFile(resolvedPath);
+    if (htmlBuffer.byteLength < 1 || htmlBuffer.byteLength > MAX_DECK_BYTES) {
+      throw new ToolExecutionError(
+        'INVALID_FILE_SIZE',
+        `Deck file size must be between 1 and ${MAX_DECK_BYTES} bytes.`,
+      );
+    }
+    return htmlBuffer;
+  }
+
+  async function handleValidateDeck(args) {
+    const { resolvedPath } = await statLocalDeckFile(args.file_path);
+    const htmlBuffer = await readLocalDeckBytes(resolvedPath);
+    return {
+      filePath: resolvedPath,
+      ...validateDeckHtml(htmlBuffer),
+    };
+  }
+
+  async function handleExportDeck(args) {
+    const { resolvedPath, ext } = await statLocalDeckFile(args.file_path);
+
     if (args.slug !== undefined) {
       if (typeof args.slug !== 'string' || !SLUG_REGEX.test(args.slug)) {
         throw new ToolExecutionError(
@@ -1530,13 +2544,7 @@ export function createArtifactBoardMcpServer(options = {}) {
 
     const { origin, token } = await requireAuth();
 
-    const htmlBuffer = await readFile(resolvedPath);
-    if (htmlBuffer.byteLength < 1 || htmlBuffer.byteLength > MAX_DECK_BYTES) {
-      throw new ToolExecutionError(
-        'INVALID_FILE_SIZE',
-        `Deck file size must be between 1 and ${MAX_DECK_BYTES} bytes.`,
-      );
-    }
+    const htmlBuffer = await readLocalDeckBytes(resolvedPath);
 
     const explicitTitle = typeof args.title === 'string' ? args.title.trim() : '';
     const extractedTitle = explicitTitle ? '' : extractHtmlTitle(htmlBuffer);
@@ -1900,6 +2908,9 @@ export function createArtifactBoardMcpServer(options = {}) {
           break;
         case 'artifactboard_download_deck':
           payload = await handleDownloadDeck(args);
+          break;
+        case 'artifactboard_validate_deck':
+          payload = await handleValidateDeck(args);
           break;
         default:
           return formatToolResult(
